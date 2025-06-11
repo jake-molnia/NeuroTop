@@ -1,0 +1,219 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Machine Learning Specific
+# Models
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.pb
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.model
+*.weights
+models/
+checkpoints/
+saved_models/
+
+# Data files
+*.csv
+*.json
+*.jsonl
+*.parquet
+*.feather
+*.arrow
+*.tsv
+*.xlsx
+*.xls
+*.sqlite
+*.db
+*.h5
+*.hdf5
+data/
+datasets/
+raw_data/
+processed_data/
+features/
+
+# Logs and outputs
+logs/
+outputs/
+results/
+experiments/
+runs/
+lightning_logs/
+tensorboard/
+wandb/
+mlruns/
+.mlflow/
+
+# Notebooks (optional - uncomment if you don't want to track notebooks)
+# *.ipynb
+
+# Cache directories
+.cache/
+__pycache__/
+.pytest_cache/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Configuration files with secrets
+config.py
+secrets.py
+.env.local
+.env.production
+
+# Specific ML frameworks
+# TensorFlow
+*.tfevents.*
+checkpoint
+model.ckpt.*
+
+# PyTorch
+*.pth.tar
+
+# Scikit-learn
+*.joblib
+
+# Hugging Face
+.cache/huggingface/
+
+# DVC (Data Version Control)
+.dvc/
+.dvcignore
+
+# Docker
+.dockerignore
+Dockerfile.
