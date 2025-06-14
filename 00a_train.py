@@ -1,4 +1,4 @@
-# train.py
+# 00a_train.py
 
 import click
 from pathlib import Path
@@ -13,16 +13,55 @@ from torch.utils.data import DataLoader
 from icecream import ic
 import wandb
 
-from modules import MLPnet
+# --- Import all models ---
+from modules import MLPnet, ResNetForCifar, VGGForCifar, label_smooth
 
-def label_smooth(y, n_class=10):
-    """Applies label smoothing."""
-    y_one_hot = torch.ones(len(y), n_class) * (0.1 / (n_class - 1))
-    y_one_hot.scatter_(1, y.unsqueeze(1), 0.9)
-    return y_one_hot
+def get_dataset(dataset_name, data_root='./data'):
+    """Gets the specified dataset from torchvision."""
+    ic(f"Loading {dataset_name} dataset...")
+    
+    # Normalization constants for different datasets
+    DATASET_STATS = {
+        'cifar10': ((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+        'cifar100': ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        'svhn': ((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
+        'fashion_mnist': ((0.2860,), (0.3530,))
+    }
+    
+    if dataset_name not in DATASET_STATS:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+        
+    mean, std = DATASET_STATS[dataset_name]
+    
+    # Fashion-MNIST is grayscale, needs a different transform pipeline
+    if dataset_name == 'fashion_mnist':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+            transforms.Grayscale(num_output_channels=3), # Convert to 3 channels for CNNs
+        ])
+        dataset_class = torchvision.datasets.FashionMNIST
+        return dataset_class(root=data_root, train=True, download=True, transform=transform)
 
-def train_model(model, trainloader, device, epochs, lr):
-    """The main training loop with wandb logging."""
+    # Transforms for color datasets
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    
+    if dataset_name == 'cifar10':
+        dataset_class = torchvision.datasets.CIFAR10
+    elif dataset_name == 'cifar100':
+        dataset_class = torchvision.datasets.CIFAR100
+    elif dataset_name == 'svhn':
+        # SVHN uses 'split' instead of 'train'
+        return torchvision.datasets.SVHN(root=data_root, split='train', download=True, transform=transform)
+        
+    return dataset_class(root=data_root, train=True, download=True, transform=transform)
+
+
+def train_model(model, trainloader, device, epochs, lr, num_classes=10):
+    """The main training loop, now handles both single and dual output models."""
     ic(f"Starting training for {epochs} epochs on {device}...")
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -36,15 +75,25 @@ def train_model(model, trainloader, device, epochs, lr):
         
         for inputs, labels in trainloader:
             inputs, labels = inputs.to(device), labels.to(device)
-            smooth_labels = label_smooth(labels, 10).to(device)
             
             optimizer.zero_grad()
             
-            main_out, aux_out = model(inputs)
-            main_loss = F.kl_div(F.log_softmax(main_out, dim=1), smooth_labels, reduction='batchmean')
-            aux_loss = F.kl_div(F.log_softmax(aux_out, dim=1), smooth_labels, reduction='batchmean')
-            loss = main_loss + 0.3 * aux_loss
+            outputs = model(inputs)
             
+            # --- Handle different model output signatures ---
+            if isinstance(outputs, tuple):
+                # For MLPnet with auxiliary output
+                main_out, aux_out = outputs
+                smooth_labels = label_smooth(labels, num_classes).to(device)
+                main_loss = F.kl_div(F.log_softmax(main_out, dim=1), smooth_labels, reduction='batchmean')
+                aux_loss = F.kl_div(F.log_softmax(aux_out, dim=1), smooth_labels, reduction='batchmean')
+                loss = main_loss + 0.3 * aux_loss
+            else:
+                # For standard models (ResNet, VGG)
+                main_out = outputs
+                loss = F.cross_entropy(main_out, labels) # Standard cross-entropy is fine here
+            # -----------------------------------------------
+
             loss.backward()
             optimizer.step()
             
@@ -54,72 +103,51 @@ def train_model(model, trainloader, device, epochs, lr):
             correct_preds += (predicted == labels).sum().item()
         
         scheduler.step()
-        
         epoch_loss = running_loss / len(trainloader)
         epoch_acc = 100 * correct_preds / total_samples
-        
-        # Log metrics to wandb
-        #wandb.log({
-        #    'epoch': epoch,
-        #    'train_loss': epoch_loss,
-        #    'train_acc': epoch_acc,
-        #    'lr': optimizer.param_groups[0]['lr']
-        #})
-        
         ic(f'Epoch {epoch+1:02d}/{epochs} - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.2f}%')
 
 @click.command()
-@click.option('--model', type=click.Choice(['MLPnet']), default='MLPnet', help='Model architecture to train.')
+@click.option('--model', type=click.Choice(['MLPnet', 'resnet18', 'resnet34', 'vgg11_bn', 'vgg16_bn']), default='resnet18', help='Model architecture to train.')
+@click.option('--dataset', type=click.Choice(['cifar10', 'cifar100', 'svhn', 'fashion_mnist']), default='cifar10', help='Dataset to use for training.')
 @click.option('--epochs', type=int, default=50, help='Number of training epochs.')
 @click.option('--lr', type=float, default=1e-3, help='Learning rate.')
 @click.option('--batch-size', type=int, default=128, help='Training batch size.')
-@click.option('--save-path', type=click.Path(path_type=Path), default='outputs/weights/cifar10_mlp.pth', help='Path to save the trained model weights.')
-@click.option('--wandb-project', default='neural-topology', help='Wandb project name.')
-@click.option('--wandb-name', default=None, help='Wandb run name (defaults to a random name).')
-def main(model, epochs, lr, batch_size, save_path, wandb_project, wandb_name):
-    """Train a model on CIFAR-10 and log progress to Weights & Biases."""
-    
-    # Initialize wandb
-    config = {
-        'model': model,
-        'epochs': epochs,
-        'lr': lr,
-        'batch_size': batch_size,
-        'dataset': 'CIFAR-10'
-    }
-    #wandb.init(project=wandb_project, name=wandb_name, config=config)
+@click.option('--save-dir', type=click.Path(path_type=Path), default='outputs/weights', help='Directory to save the trained model weights.')
+def main(model, dataset, epochs, lr, batch_size, save_dir):
+    """Train a specified model on a specified dataset."""
     
     # Setup
-    #device = torch.device('mps' if torch.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
+    device = torch.device('mps')
     ic(f"Using device: {device}")
+    
+    # Dynamic save path
+    save_path = save_dir / f'{dataset}_{model}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Data Loading
-    ic("Loading CIFAR-10 dataset...")
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-    ])
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    trainset = get_dataset(dataset, data_root='./data')
+    num_classes = len(trainset.classes) if hasattr(trainset, 'classes') else 10 # SVHN/FashionMNIST don't have a .classes attribute
+    trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
     
     # Model Initialization
-    ic(f"Initializing model: {model}")
+    ic(f"Initializing model: {model} for {num_classes} classes")
     if model == 'MLPnet':
-        net = MLPnet().to(device)
-        #wandb.watch(net) # Watch model gradients
+        net = MLPnet(num_class=num_classes).to(device)
+    elif 'resnet' in model:
+        net = ResNetForCifar(resnet_type=model, num_classes=num_classes).to(device)
+    elif 'vgg' in model:
+        net = VGGForCifar(vgg_type=model, num_classes=num_classes).to(device)
     else:
         raise ValueError(f"Unknown model type: {model}")
 
     # Training
-    train_model(net, trainloader, device, epochs, lr)
+    train_model(net, trainloader, device, epochs, lr, num_classes)
     
     # Save Model
     ic(f"Saving model weights to: {save_path}")
     torch.save(net.state_dict(), save_path)
     
-    #wandb.finish()
     ic("Training complete.")
     return
 

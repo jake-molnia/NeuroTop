@@ -15,109 +15,83 @@ import seaborn as sns
 import random
 
 # --- Activation Collection ---
-
 class ActivationCollector:
-    """A helper class to collect activations using forward hooks."""
     def __init__(self):
         self.activations = {}
-    
     def hook(self, name):
         def fn(module, input, output):
             self.activations[name] = output.detach().cpu().numpy()
         return fn
-    
     def clear(self):
         self.activations = {}
 
 def collect_activations(model, dataloader, device):
-    """
-    Runs the dataloader through the model and collects activations from
-    the layers specified in model.get_feature_layers().
-    """
     ic("Collecting activations...")
-    
     collector = ActivationCollector()
     feature_layers = model.get_feature_layers()
-    
     hooks = [layer.register_forward_hook(collector.hook(name)) for name, layer in feature_layers.items()]
-    
     all_activations = {name: [] for name in feature_layers.keys()}
-    
     model.eval()
     with torch.no_grad():
         for i, (inputs, labels) in enumerate(dataloader):
             ic(f"Processing batch {i+1}/{len(dataloader)}")
             inputs = inputs.to(device)
-            # We only need one forward pass to trigger all the hooks
-            model(inputs) 
-            
-            # The collector now holds the activations from the single pass
+            # Pass masks=None to use the default (unmasked) forward pass
+            model(inputs, masks=None) 
             for name in feature_layers.keys():
                 all_activations[name].append(collector.activations[name])
-            
-            collector.clear() # Clear for next batch
-    
+            collector.clear()
     for hook in hooks:
         hook.remove()
-    
     for name, act_list in all_activations.items():
         all_activations[name] = np.vstack(act_list)
-    
-    ic("Activation collection complete.")
-    for name, acts in all_activations.items():
-        ic(f"  {name}: {acts.shape}")
-        
     return all_activations
 
 # --- Topological and Distance Analysis ---
-
-def compute_neuron_distances(activations_dict, device, metric='euclidean', max_samples=5000, reduce_dims=None):
-    ic(f"Computing neuron distances with metric: '{metric}' on device: '{device}'...")
-    
+def compute_neuron_distances(activations_dict, device, metric='euclidean', max_samples=7000, reduce_dims=None):
+    """
+    Computes neuron distances, correctly handling both MLP (2D) and CNN (4D) activations.
+    """
+    ic(f"Computing neuron distances with metric: '{metric}'...")
     layer_names = list(activations_dict.keys())
-    layer_activations = list(activations_dict.values())
     
-    layer_labels = []
-    layer_indices = [0]
-    cumulative_neurons = 0
+    processed_activations = []
+    for name in layer_names:
+        activation = activations_dict[name]
+        # Check if activation is from a CNN (4D: N, C, H, W)
+        if activation.ndim == 4:
+            # Average over spatial dimensions (H, W) to get a per-channel activation
+            # This gives a representative vector for each "neuron" (channel).
+            # Shape becomes (N, C)
+            activation = np.mean(activation, axis=(2, 3))
+        processed_activations.append(activation)
+
+    layer_labels, layer_indices, cumulative_neurons = [], [0], 0
     for i, name in enumerate(layer_names):
-        num_neurons = layer_activations[i].shape[1]
+        num_neurons = processed_activations[i].shape[1]
         layer_labels.extend([name] * num_neurons)
         cumulative_neurons += num_neurons
         layer_indices.append(cumulative_neurons)
-
-    all_neurons_activation = np.hstack(layer_activations)
+        
+    # hstack now works correctly on the list of 2D arrays
+    all_neurons_activation = np.hstack(processed_activations)
+    # Transpose to get shape (num_neurons, num_samples)
     neurons_np = all_neurons_activation.T
     
-    ic(f"Neuron data shape before processing: {neurons_np.shape}")
-    
-    if reduce_dims is not None and neurons_np.shape[1] > reduce_dims:
-        ic(f"Reducing feature dimensions from {neurons_np.shape[1]} to {reduce_dims} using PCA.")
-        pca = PCA(n_components=reduce_dims, random_state=42)
-        neurons_np = pca.fit_transform(neurons_np.T).T
-        ic(f"Neuron data shape after PCA: {neurons_np.shape}")
-    
-    if neurons_np.shape[1] > max_samples:
-        ic(f"Subsampling from {neurons_np.shape[1]} to {max_samples} samples.")
-        idx = np.random.choice(neurons_np.shape[1], max_samples, replace=False)
-        neurons_np = neurons_np[:, idx]
-    
-    neurons_torch = torch.from_numpy(neurons_np).to(device)
-    
-    if metric == 'euclidean':
-        distance_matrix_torch = torch.cdist(neurons_torch.T, neurons_torch.T, p=2)
-    elif metric == 'cosine':
-        norm_neurons = F.normalize(neurons_torch.T, p=2, dim=1)
-        cos_sim = torch.mm(norm_neurons, norm_neurons.t())
-        distance_matrix_torch = 1 - cos_sim
-        distance_matrix_torch = torch.clamp(distance_matrix_torch, min=0.0)
-    else:
-        raise ValueError(f"Metric '{metric}' not supported for GPU computation.")
-        
-    distance_matrix = distance_matrix_torch.cpu().numpy()
+    if neurons_np.shape[0] > max_samples:
+        ic(f"Subsampling from {neurons_np.shape[0]} to {max_samples} neurons for distance calculation.")
+        idx = np.random.choice(neurons_np.shape[0], max_samples, replace=False)
+        neurons_np = neurons_np[idx]
+        # Note: Subsampling neurons means the layer_labels and indices are now incorrect for the
+        # returned distance matrix. This is acceptable if the goal is just the topology of the subsample.
+        # For full-network analysis, max_samples should be >= total neurons.
+        layer_labels, layer_indices = None, None # Invalidate these as they no longer match
+
+    # pdist computes pairwise distances between rows
+    distance_matrix = squareform(pdist(neurons_np, metric=metric))
     
     ic(f"Distance matrix shape: {distance_matrix.shape}")
-    return distance_matrix, neurons_np.T, layer_labels, layer_indices
+    return distance_matrix, neurons_np, layer_labels, layer_indices
 
 
 def run_persistent_homology(distance_matrix, maxdim=2, thresh=25.0):
@@ -149,8 +123,8 @@ def identify_neuron_clusters(embedding, eps, min_samples=2):
     
     return clusters
 
-def evaluate_model_performance(model, dataloader, device):
-    """Evaluates model accuracy and loss on a given dataset."""
+def evaluate_model_performance(model, dataloader, device, masks=None):
+    """Evaluates model accuracy and loss, correctly passing masks to the model."""
     model.eval()
     total_loss = 0
     correct_preds = 0
@@ -160,8 +134,16 @@ def evaluate_model_performance(model, dataloader, device):
     with torch.no_grad():
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
-            main_out, _ = model(inputs)
             
+            outputs = model(inputs, masks=masks) 
+            
+            if isinstance(outputs, tuple):
+                main_out, _ = outputs
+            else:
+                main_out = outputs
+            
+            if main_out is None: continue
+
             loss = criterion(main_out, labels)
             total_loss += loss.item()
             
