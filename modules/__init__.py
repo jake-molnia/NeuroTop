@@ -13,7 +13,7 @@ def label_smooth(y, n_class=10):
     return y_one_hot
 
 # --- Import all model classes ---
-from .models import MLPnet, ResNetForCifar, VGGForCifar
+from .models import MLPnet, ResNetForCifar, VGGForCifar, SimpleMLPOld, SimpleMLPNew, DetailedLSTMSentiment, MNIST_MLP
 
 from .analysis import (
     collect_activations,
@@ -41,6 +41,10 @@ __all__ = [
     "MLPnet",
     "ResNetForCifar",
     "VGGForCifar",
+    "SimpleMLPOld",
+    "SimpleMLPNew",
+    "DetailedLSTMSentiment",
+    "MNIST_MLP",
     # Analysis Functions
     "collect_activations",
     "compute_neuron_distances", 
@@ -56,5 +60,5 @@ __all__ = [
     "_get_tsne_embedding",
     "identify_by_distance",
     "identify_by_knn_distance",
-    "identify_by_homology_degree"
+    "identify_by_homology_degree",
 ]

@@ -2,9 +2,9 @@ numpy==2.3.0
 torch==2.7.1
 torchvision==0.22.1
 matplotlib==3.10.3
-ipykernel==6.29.5 # for now
 ripser==0.6.12
 seaborn==0.13.2
 click==8.2.1
 icecream==2.1.4
 wandb==0.20.1
+torchtext

@@ -97,12 +97,14 @@ def compute_neuron_distances(activations_dict, device, metric='euclidean', max_s
 def run_persistent_homology(distance_matrix, maxdim=2, thresh=25.0):
     """Runs Ripser to compute persistence diagrams."""
     ic(f"Running persistent homology (maxdim={maxdim}, thresh={thresh})...")
-    result = ripser(distance_matrix, metric='precomputed', maxdim=maxdim, thresh=thresh)
-    
+
+    # KEY FIX: Replace metric='precomputed' with distance_matrix=True
+    result = ripser(distance_matrix, distance_matrix=True, maxdim=maxdim, thresh=thresh)
+
     for dim in range(maxdim + 1):
         num_features = len(result['dgms'][dim])
         ic(f"Found {num_features} features in dimension {dim}.")
-    
+
     return result
 
 # --- Neuron Ablation and Evaluation ---
