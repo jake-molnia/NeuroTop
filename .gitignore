@@ -159,6 +159,7 @@ tensorboard/
 wandb/
 mlruns/
 .mlflow/
+experiment_grid/
 
 # Notebooks (optional - uncomment if you don't want to track notebooks)
 # *.ipynb

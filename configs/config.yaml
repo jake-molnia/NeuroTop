@@ -1,0 +1,101 @@
+# configs/mlp_baseline.yaml
+
+# ----------------------------------------------------------------------
+# 1. EXPERIMENT MANAGEMENT & METADATA
+# ----------------------------------------------------------------------
+run_name: "MLP_BN-True_Drop-0.5_Homology-Ablation"
+description: "Baseline MLP test with standard regularization to validate the homology-degree ablation strategy."
+tags: ["MLP", "baseline", "MNIST", "dropout"]
+seed: 42
+
+# ----------------------------------------------------------------------
+# 2. DATASET CONFIGURATION
+# ----------------------------------------------------------------------
+dataset:
+  name: "MNIST"
+  path: "./data"
+  batch_size: 128
+  num_workers: 4
+
+# ----------------------------------------------------------------------
+# 3. MODEL CONFIGURATION
+# ----------------------------------------------------------------------
+model:
+  - name: "MLP1"
+    architecture: "MNIST_MLP"
+    load_checkpoint_path: null
+    params:
+      use_batchnorm: False
+      dropout_rate: 0.8
+  - name: "MLP2"
+    architecture: "MNIST_MLP"
+    load_checkpoint_path: null
+    params:
+      use_batchnorm: False
+      dropout_rate: 0.6
+
+# ----------------------------------------------------------------------
+# 4. TRAINING CONFIGURATION
+# ----------------------------------------------------------------------
+training:
+  enabled: true
+  epochs: 10
+  optimizer:
+    name: "Adam"
+    params:
+      lr: 0.001
+      weight_decay: 0.0001
+  lr_scheduler:
+    name: "StepLR"
+    params:
+      step_size: 5
+      gamma: 0.1
+  loss_function: "CrossEntropyLoss"
+
+# ----------------------------------------------------------------------
+# 5. ANALYSIS CONFIGURATION
+# ----------------------------------------------------------------------
+analysis:
+  activation_extraction:
+    layers: ["layer1", "layer2", "layer3"]
+    dataset_split: "test"
+    max_samples: 1000
+
+  topology:
+    homology_dimensions: [0, 1]
+    distance_metric: "euclidean"
+
+  visualizations:
+    persistence_diagram: true
+    tsne_plot: true
+    distance_matrix: true
+
+  ablation:
+    # Options: "homology_degree", "knn_distance", "random"
+    - strategy: "homology_degree"
+      step: 5 # e.g., 5 means [0, 5, 10, ..., 100]
+
+      params:
+        homology_degree:
+          # Which homology dimension to use for ranking neurons (0 for components, 1 for loops)
+          homology_dim: 1
+        knn_distance:
+          k: 5 # Number of nearest neighbors
+    - strategy: "homology_degree"
+      step: 5 # e.g., 5 means [0, 5, 10, ..., 100]
+
+      params:
+        homology_degree:
+          # Which homology dimension to use for ranking neurons (0 for components, 1 for loops)
+          homology_dim: 2
+        knn_distance:
+          k: 5 # Number of nearest neighbors
+
+# ----------------------------------------------------------------------
+# 6. OUTPUT CONFIGURATION
+# ----------------------------------------------------------------------
+outputs:
+  base_dir: "./experiments"
+  save_model_checkpoint: true
+  save_activations: true
+  save_results_csv: true

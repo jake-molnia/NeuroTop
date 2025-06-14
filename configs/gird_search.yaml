@@ -1,0 +1,71 @@
+# configs/grid_search.yaml
+# This file defines a grid of experiments. The script will run all combinations
+# of models and ablation strategies defined below.
+
+# ----------------------------------------------------------------------
+# 1. COMMON SETTINGS
+# These settings apply to all generated experiments.
+# ----------------------------------------------------------------------
+base_config:
+  description: "Grid search over MLP models and ablation strategies."
+  tags: ["MLP", "grid_search", "MNIST"]
+  seed: 42
+  dataset:
+    name: "MNIST"
+    path: "./data"
+    batch_size: 128
+    num_workers: 4
+  training:
+    enabled: true
+    epochs: 10
+    optimizer:
+      name: "Adam"
+      params:
+        lr: 0.001
+    lr_scheduler:
+      name: "StepLR"
+      params:
+        step_size: 5
+        gamma: 0.1
+  analysis:
+    activation_extraction:
+      layers: ["layer1", "layer2", "layer3"]
+      dataset_split: "test"
+      max_samples: 100000
+    visualizations:
+      tsne_plot: false # Disable expensive plots for faster suite runs
+      distance_matrix: true
+      persistence_diagram: true
+  outputs:
+    base_dir: "./experiment_grid" # Use a new directory for grid results
+    save_model_checkpoint: true
+    save_activations: false
+    save_results_csv: true
+
+# ----------------------------------------------------------------------
+# 2. EXPERIMENT AXES
+# The script will generate the Cartesian product of these lists.
+# ----------------------------------------------------------------------
+
+# --- AXIS 1: Models ---
+models:
+  - name: "MLP_BN-F_Drop-0.8"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: false
+      dropout_rate: 0.8
+
+# --- AXIS 2: Ablation Strategies ---
+ablations:
+  - strategy: "homology_degree"
+    step: 5
+    params:
+      homology_degree:
+        homology_dim: 1
+  - strategy: "knn_distance"
+    step: 5
+    params:
+      knn_distance:
+        k: 5
+  - strategy: "random"
+    step: 5
