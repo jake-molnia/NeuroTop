@@ -31,6 +31,8 @@ base_config:
       layers: ["layer1", "layer2", "layer3"] # Layers to form the global neuron space
       dataset_split: "test"
       max_samples: 100000 # Use 10k samples from the test set for analysis
+      normalize_activations: true # New flag for normalization
+      normalization_method: "standard" # Options: "standard", "minmax", "none"
     visualizations:
       tsne_plot: false # Disable expensive plots for faster suite runs
       distance_matrix: true

@@ -6,7 +6,7 @@ import pandas as pd
 from pathlib import Path
 from copy import deepcopy
 import itertools
-from sklearn.preprocessing import StandardScaler
+from icecream import ic
 
 from modules.utils import set_seed
 from modules.data import get_dataloaders
@@ -40,10 +40,10 @@ def run_ablation_on_model(config, model, activations):
         yaml.dump(config, f, default_flow_style=False)
         
     print(f"--- Applying ablation '{ablation_strategy}' to model '{model_run_name}' ---")
-    print(f"Output directory: {output_dir}")
+    ic(f"Output directory: {output_dir}")
+    ic(f"Ablation config: {ablation_config}")
 
     # --- Global Analysis Setup ---
-    print("--- Concatenating activations for global analysis ---")
     layers_to_analyze = config['analysis']['activation_extraction']['layers']
     
     concatenated_activations_list = []
@@ -64,48 +64,47 @@ def run_ablation_on_model(config, model, activations):
         return
 
     concatenated_activations = torch.cat(concatenated_activations_list, dim=1)
-    print(f"Total neurons for global analysis: {concatenated_activations.shape[1]}")
+    ic(f"Total neurons for global analysis: {concatenated_activations.shape[1]}")
+    ic(f"Samples per neuron: {concatenated_activations.shape[0]}")
 
-    # This is the crucial step. It scales each neuron's activity across all samples
-    # to have a mean of 0 and a standard deviation of 1. This prevents neurons
-    # with high activation values from dominating the distance calculations.
-    print("--- Normalizing concatenated activations for robust analysis ---")
-    scaler = StandardScaler()
-    # We transpose (.T) because the scaler expects features in columns.
-    # Here, neurons are our "features" we want to scale.
-    scaled_activations_T = scaler.fit_transform(concatenated_activations.T.cpu().numpy())
-    # Transpose back and convert to a tensor for the analysis functions.
-    scaled_activations = torch.from_numpy(scaled_activations_T.T).float()
-
-    # All subsequent analysis will now use the properly scaled data.
-    dist_matrix = get_distance_matrix(scaled_activations)
+    # Note: Normalization is now handled during activation extraction
+    # so concatenated_activations should already be normalized if requested
+    dist_matrix = get_distance_matrix(concatenated_activations)
 
     # --- Visualizations on Global Data ---
     viz_config = config['analysis'].get('visualizations', {})
+    ic(f"Visualization config: {viz_config}")
+    
     if viz_config.get('persistence_diagram'):
         # Pass the correctly calculated distance matrix
         diagrams = calculate_betti_curves(dist_matrix, maxdim=2) # Increased maxdim to check H2
         plot_persistence_diagram(diagrams, output_dir / 'persistence_diagram_global.png')
     if viz_config.get('tsne_plot'):
-        # Pass the scaled activations for a more meaningful t-SNE plot
-        plot_tsne(scaled_activations, output_dir / 'tsne_plot_global.png')
+        # Pass the (potentially normalized) activations for a more meaningful t-SNE plot
+        plot_tsne(concatenated_activations, output_dir / 'tsne_plot_global.png')
     if viz_config.get('distance_matrix'):
-        # Plot the new, scaled distance matrix to verify it looks correct
-        plot_distance_matrix(dist_matrix, output_dir / 'distance_matrix_global_SCALED.png')
+        # Plot the distance matrix
+        plot_distance_matrix(dist_matrix, output_dir / 'distance_matrix_global.png')
 
     # --- Global Ablation Test ---
     ablation_strategy_func = get_ablation_strategy(ablation_strategy)
     strategy_params = ablation_config.get('params', {}).get(ablation_strategy, {})
-    # Ensure the analysis functions receive the scaled activations and corresponding distance matrix
-    global_neuron_order = ablation_strategy_func(scaled_activations, dist_matrix, **strategy_params)
+    ic(f"Strategy function: {ablation_strategy_func.__name__}")
+    ic(f"Strategy params: {strategy_params}")
+    
+    # Ensure the analysis functions receive the activations and corresponding distance matrix
+    global_neuron_order = ablation_strategy_func(concatenated_activations, dist_matrix, **strategy_params)
     
     # Check if neuron ordering returned a valid result
     if global_neuron_order is None or len(global_neuron_order) == 0:
         print(f"Warning: Ablation strategy '{ablation_strategy}' returned no neuron order. Skipping ablation test.")
         return
     
+    ic(f"Ablation order computed, first 10 neurons: {global_neuron_order[:10]}")
+    
     ablation_step = ablation_config.get('step', 5)
     percentages = list(range(0, 101, ablation_step))
+    ic(f"Ablation percentages: {percentages}")
     
     device = next(model.parameters()).device
     _, test_loader = get_dataloaders(config)
@@ -114,6 +113,7 @@ def run_ablation_on_model(config, model, activations):
     results_path = output_dir / 'ablation_results.csv'
     ablation_results_df.to_csv(results_path, index=False)
     print(f"Ablation results saved to {results_path}")
+    ic(f"Results shape: {ablation_results_df.shape}")
 
 
 @click.command()
@@ -136,6 +136,9 @@ def main(config_path):
 
     print(f"Found {len(model_configs)} model(s) and {len(ablation_configs)} ablation strategie(s).")
     print("Beginning experiment suite...")
+    ic(f"Base config keys: {list(base_config.keys())}")
+    ic(f"Models: {[m.get('name', 'unnamed') for m in model_configs]}")
+    ic(f"Ablation strategies: {[a.get('strategy', 'unnamed') for a in ablation_configs]}")
 
     # --- Outer Loop: Iterate over Models ---
     for model_spec in model_configs:
@@ -147,11 +150,14 @@ def main(config_path):
         print(f"PROCESSING MODEL: {model_name}")
         print(f"{'='*60}")
         
+        ic(f"Model spec: {model_spec}")
         set_seed(model_config['seed'])
         device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        ic(f"Device: {device}")
         
         model_output_dir = Path(model_config['outputs']['base_dir']) / model_name
         model_output_dir.mkdir(parents=True, exist_ok=True)
+        ic(f"Model output directory: {model_output_dir}")
         
         model = get_model(model_config['model'])
         model.to(device)
@@ -164,6 +170,7 @@ def main(config_path):
             model = train_and_evaluate(model_config, model, train_loader, test_loader, device)
             if model_config['outputs']['save_model_checkpoint']:
                 torch.save(model.state_dict(), model_checkpoint_path)
+                ic(f"Model checkpoint saved to {model_checkpoint_path}")
         else:
             print(f"--- Loading or using existing model: {model_name} ---")
             if model_checkpoint_path.exists():
@@ -177,11 +184,22 @@ def main(config_path):
             print(f"--- Extracting activations for {model_name} ---")
             _, test_loader = get_dataloaders(model_config)
             required_layers = model_config['analysis']['activation_extraction']['layers']
-            activations = extract_activations(model, test_loader, required_layers, model_config['analysis']['activation_extraction']['max_samples'], device)
+            max_samples = model_config['analysis']['activation_extraction']['max_samples']
+            
+            # Get normalization settings from config
+            normalize_activations = model_config['analysis']['activation_extraction'].get('normalize_activations', True)
+            normalization_method = model_config['analysis']['activation_extraction'].get('normalization_method', 'standard')
+            ic(f"Normalization settings: normalize={normalize_activations}, method={normalization_method}")
+            
+            activations = extract_activations(model, test_loader, required_layers, max_samples, device, 
+                                            normalize_activations=normalize_activations, 
+                                            normalization_method=normalization_method)
             torch.save(activations, activations_path)
+            ic(f"Activations saved to {activations_path}")
         else:
             print(f"--- Loading existing activations for {model_name} ---")
             activations = torch.load(activations_path)
+            ic(f"Loaded activations from {activations_path}")
 
         # --- Inner Loop: Iterate over Ablation Strategies ---
         for ablation_spec in ablation_configs:
