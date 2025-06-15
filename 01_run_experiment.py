@@ -6,6 +6,7 @@ import pandas as pd
 from pathlib import Path
 from copy import deepcopy
 import itertools
+from sklearn.preprocessing import StandardScaler
 
 from modules.utils import set_seed
 from modules.data import get_dataloaders
@@ -21,6 +22,7 @@ from modules.analysis import (
     plot_tsne,
     plot_distance_matrix
 )
+
 
 def run_ablation_on_model(config, model, activations):
     """
@@ -64,22 +66,43 @@ def run_ablation_on_model(config, model, activations):
     concatenated_activations = torch.cat(concatenated_activations_list, dim=1)
     print(f"Total neurons for global analysis: {concatenated_activations.shape[1]}")
 
-    dist_matrix = get_distance_matrix(concatenated_activations)
+    # This is the crucial step. It scales each neuron's activity across all samples
+    # to have a mean of 0 and a standard deviation of 1. This prevents neurons
+    # with high activation values from dominating the distance calculations.
+    print("--- Normalizing concatenated activations for robust analysis ---")
+    scaler = StandardScaler()
+    # We transpose (.T) because the scaler expects features in columns.
+    # Here, neurons are our "features" we want to scale.
+    scaled_activations_T = scaler.fit_transform(concatenated_activations.T.cpu().numpy())
+    # Transpose back and convert to a tensor for the analysis functions.
+    scaled_activations = torch.from_numpy(scaled_activations_T.T).float()
+
+    # All subsequent analysis will now use the properly scaled data.
+    dist_matrix = get_distance_matrix(scaled_activations)
 
     # --- Visualizations on Global Data ---
     viz_config = config['analysis'].get('visualizations', {})
     if viz_config.get('persistence_diagram'):
-        diagrams = calculate_betti_curves(dist_matrix, maxdim=1)
+        # Pass the correctly calculated distance matrix
+        diagrams = calculate_betti_curves(dist_matrix, maxdim=2) # Increased maxdim to check H2
         plot_persistence_diagram(diagrams, output_dir / 'persistence_diagram_global.png')
     if viz_config.get('tsne_plot'):
-        plot_tsne(concatenated_activations, output_dir / 'tsne_plot_global.png')
+        # Pass the scaled activations for a more meaningful t-SNE plot
+        plot_tsne(scaled_activations, output_dir / 'tsne_plot_global.png')
     if viz_config.get('distance_matrix'):
-        plot_distance_matrix(dist_matrix, output_dir / 'distance_matrix_global.png')
+        # Plot the new, scaled distance matrix to verify it looks correct
+        plot_distance_matrix(dist_matrix, output_dir / 'distance_matrix_global_SCALED.png')
 
     # --- Global Ablation Test ---
     ablation_strategy_func = get_ablation_strategy(ablation_strategy)
     strategy_params = ablation_config.get('params', {}).get(ablation_strategy, {})
-    global_neuron_order = ablation_strategy_func(concatenated_activations, dist_matrix, **strategy_params)
+    # Ensure the analysis functions receive the scaled activations and corresponding distance matrix
+    global_neuron_order = ablation_strategy_func(scaled_activations, dist_matrix, **strategy_params)
+    
+    # Check if neuron ordering returned a valid result
+    if global_neuron_order is None or len(global_neuron_order) == 0:
+        print(f"Warning: Ablation strategy '{ablation_strategy}' returned no neuron order. Skipping ablation test.")
+        return
     
     ablation_step = ablation_config.get('step', 5)
     percentages = list(range(0, 101, ablation_step))

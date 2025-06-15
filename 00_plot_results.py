@@ -51,14 +51,14 @@ def main(experiments_dir):
     plt.figure(figsize=(14, 9))
     
     # Use seaborn to create a rich plot:
-    # - hue will use color to distinguish models
-    # - style will use line style (solid, dashed) to distinguish strategies
+    # - style will use color to distinguish models
+    # - hue will use line style (solid, dashed) to distinguish strategies
     sns.lineplot(
         data=combined_df, 
         x='percent_removed', 
         y='accuracy', 
-        hue='Model',
-        style='Strategy',
+        style='Model',
+        hue='Strategy',
         marker='',
         markersize=6,
         linewidth=2
