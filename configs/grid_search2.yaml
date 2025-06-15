@@ -29,14 +29,14 @@ base_config:
   analysis:
     activation_extraction:
       layers: ["layer1", "layer2", "layer3"] # Layers to form the global neuron space
-      dataset_split: "test"
+      dataset_split: "train"
       max_samples: 100000 # Use 10k samples from the test set for analysis
-      normalize_activations: true # New flag for normalization
-      normalization_method: "standard" # Options: "standard", "minmax", "none"
+      normalize_activations: false # New flag for normalization
+      normalization_method: "none" # Options: "standard", "minmax", "none"
     visualizations:
       tsne_plot: false # Disable expensive plots for faster suite runs
       distance_matrix: true
-      persistence_diagram: true # Keep this to verify topological calculations
+      persistence_diagram: false # Keep this to verify topological calculations
   outputs:
     base_dir: "./experiment_grid" # Use a new directory for grid results
     save_model_checkpoint: true
@@ -51,11 +51,11 @@ base_config:
 # --- AXIS 1: Models ---
 # Defines the different model architectures to test.
 models:
-  - name: "MLP_BN-False_Drop-0.8"
+  - name: "MLP_BN-False_Drop-0.3"
     architecture: "MNIST_MLP"
     params:
       use_batchnorm: false
-      dropout_rate: 0.8
+      dropout_rate: 0.3
 
 # --- AXIS 2: Ablation Strategies ---
 # Defines the different neuron removal strategies to test for each model.
@@ -66,11 +66,18 @@ ablations:
   #    homology_persistence:
   #      homology_dim: 1 # Filter based on the lifetime of 1D loops
 
+  - strategy: "homology_degree_H0"
+    params:
+      homology_degree:
+        homology_dim: 0 # Filter based on importance to 1D loops
   - strategy: "homology_degree_H1"
     params:
       homology_degree:
         homology_dim: 1 # Filter based on importance to 1D loops
-
+  - strategy: "homology_degree_H2"
+    params:
+      homology_degree:
+        homology_dim: 2 # Filter based on importance to 1D loops
   # --- Baseline Strategies ---
   - strategy: "random"
     params: {} # No parameters needed for random

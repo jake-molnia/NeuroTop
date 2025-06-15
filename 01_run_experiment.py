@@ -88,7 +88,11 @@ def run_ablation_on_model(config, model, activations):
 
     # --- Global Ablation Test ---
     ablation_strategy_func = get_ablation_strategy(ablation_strategy)
+    # Handle suffixed strategies by checking base name first
     strategy_params = ablation_config.get('params', {}).get(ablation_strategy, {})
+    if not strategy_params and '_' in ablation_strategy:
+        base_name = '_'.join(ablation_strategy.split('_')[:2])  # e.g., "homology_degree" from "homology_degree_H0"
+        strategy_params = ablation_config.get('params', {}).get(base_name, {})
     ic(f"Strategy function: {ablation_strategy_func.__name__}")
     ic(f"Strategy params: {strategy_params}")
     

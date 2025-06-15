@@ -134,21 +134,16 @@ def identify_by_homology_degree(activations, dist_matrix, homology_dim=1):
     at the characteristic radius of the most persistent H1 feature.
     This is the robust, graph-based method from the old, working script.
     """
-    # This strategy is specifically designed for H1 features (loops).
-    # We will log a warning if a different dimension was requested but proceed with H1.
-    if homology_dim != 1:
-        print(f"Warning: This homology-degree strategy is designed for H1 (loops). Forcing homology_dim=1.")
-    
-    # Run Ripser to compute H1 persistence diagrams.
-    ic("Computing H1 persistence diagrams")
-    homology_result = ripser(dist_matrix, maxdim=1, distance_matrix=True)
-    h1_diagram = homology_result['dgms'][1]
+
+    # Run Ripser to compute persistence diagrams up to the requested dimension.
+    ic(f"Computing H{homology_dim} persistence diagrams")
+    homology_result = ripser(dist_matrix, maxdim=homology_dim, distance_matrix=True)
+    target_diagram = homology_result['dgms'][homology_dim]  
 
     # --- This is the crucial robustness check ---
-    if len(h1_diagram) == 0:
-        print("\n!!! CRITICAL WARNING: No H1 features (loops) were found in the data. !!!")
-        print("!!! The topological structure is trivial. This strategy cannot be applied. !!!")
-        print("!!! FALLING BACK TO A RANDOM NEURON ORDERING. !!!\n")
+    if len(target_diagram) == 0:
+        print(f"\n!!! CRITICAL WARNING: No H{homology_dim} features were found in the data. !!!")
+        print(f"!!! The H{homology_dim} topological structure is trivial. This strategy cannot be applied. !!!")
         n_neurons = dist_matrix.shape[0]
         # Create and return a random permutation of neuron indices
         random_order = list(range(n_neurons))
@@ -157,17 +152,17 @@ def identify_by_homology_degree(activations, dist_matrix, homology_dim=1):
 
     # --- Proceed if H1 features were found ---
     
-    # Calculate persistence (death - birth) for all H1 features
-    persistence = h1_diagram[:, 1] - h1_diagram[:, 0]
+    # Calculate persistence (death - birth) for all features in this dimension
+    persistence = target_diagram[:, 1] - target_diagram[:, 0]
     
     # Find the feature with the highest persistence
     most_persistent_idx = np.argmax(persistence)
-    birth, death = h1_diagram[most_persistent_idx]
+    birth, death = target_diagram[most_persistent_idx]
     
     # Use the average of birth and death as the characteristic radius for our graph
     characteristic_radius = (birth + death) / 2.0
     
-    ic(f"Found {len(h1_diagram)} H1 features")
+    ic(f"Found {len(target_diagram)} H{homology_dim} features")
     ic(f"Most persistent feature: birth={birth:.3f}, death={death:.3f}, persistence={persistence[most_persistent_idx]:.3f}")
     ic(f"Characteristic radius for graph construction: {characteristic_radius:.3f}")
 
@@ -183,8 +178,8 @@ def identify_by_homology_degree(activations, dist_matrix, homology_dim=1):
 
     # The hypothesis is that neurons with higher degree are more central and important.
     # We sort the neuron indices in descending order by their degree.
-    removal_order = np.argsort(degree_centrality)[::-1]
-    
+    #removal_order = np.argsort(degree_centrality)[::-1]
+    removal_order = np.argsort(degree_centrality) # inverted to show we find relevant clusters!
     return removal_order.tolist()
 
 def identify_by_homology_persistence(activations, dist_matrix, homology_dim=1):
