@@ -191,7 +191,6 @@ Thumbs.db
 *.log
 
 # Configuration files with secrets
-config.py
 secrets.py
 .env.local
 .env.production

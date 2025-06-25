@@ -1,0 +1,479 @@
+# =============================================================================
+# MNIST BASELINE CONFIGURATION - COMPREHENSIVE EXAMPLE
+# =============================================================================
+# This configuration file demonstrates all available options for neural
+# topology analysis experiments. Use this as a reference for creating your
+# own experiments.
+
+# =============================================================================
+# 1. EXPERIMENT METADATA & GENERAL SETTINGS
+# =============================================================================
+
+# Random seed for reproducibility across all frameworks (torch, numpy, etc.)
+seed: 42
+
+# Optional experiment description for documentation
+description: "Baseline MNIST topology analysis with comprehensive ablation testing"
+
+# Tags for experiment organization and filtering
+tags: 
+  - "mnist"
+  - "baseline" 
+  - "topology"
+  - "ablation"
+  # Add more tags as needed:
+  # - "paper_experiments"
+  # - "v2_0"
+  # - "final_results"
+
+# =============================================================================
+# 2. DATASET CONFIGURATION
+# =============================================================================
+
+dataset:
+  # Dataset name - supported: MNIST, FashionMNIST, CIFAR10
+  name: "MNIST"
+  
+  # Local path where dataset will be downloaded/cached
+  path: "./data"
+  
+  # Batch size for training and evaluation
+  batch_size: 128
+  # Alternative batch sizes for different scenarios:
+  # batch_size: 64   # For limited GPU memory
+  # batch_size: 256  # For faster training with ample memory
+  # batch_size: 512  # For very large GPUs
+  
+  # Number of workers for data loading (set to 0 if having issues)
+  num_workers: 4
+  # num_workers: 0   # Use if encountering multiprocessing issues
+  # num_workers: 8   # For systems with many CPU cores
+
+# =============================================================================
+# 3. MODEL ARCHITECTURE CONFIGURATION
+# =============================================================================
+
+model:
+  # Human-readable name for this model configuration
+  name: "MLP_BN-False_Drop-0.5_Hidden-512-256-128"
+  
+  # Architecture type - determines which model class to use
+  architecture: "MNIST_MLP"
+  # architecture: "CIFAR_MLP"  # For CIFAR-10 experiments
+  
+  # Model-specific parameters
+  params:
+    # Input size (automatically set based on dataset if not specified)
+    # input_size: 784  # 28*28 for MNIST, 3072 for CIFAR-10
+    
+    # Whether to use batch normalization
+    use_batchnorm: false
+    # use_batchnorm: true   # Often helps with training stability
+    
+    # Dropout rate (0.0 = no dropout, higher values = more regularization)
+    dropout_rate: 0.5
+    # Common alternatives:
+    # dropout_rate: 0.0   # No regularization
+    # dropout_rate: 0.2   # Light regularization
+    # dropout_rate: 0.3   # Medium regularization  
+    # dropout_rate: 0.8   # Heavy regularization
+    
+    # Hidden layer sizes (tuple defining the architecture)
+    hidden_sizes: [512, 256, 128]
+    # Alternative architectures:
+    # hidden_sizes: [256, 128]        # Smaller, faster model
+    # hidden_sizes: [1024, 512, 256]  # Larger, more capacity
+    # hidden_sizes: [512, 512, 512]   # Uniform layer sizes
+    
+    # Number of output classes (automatically set based on dataset)
+    # num_classes: 10
+  
+  # Optional: Path to pre-trained model checkpoint to load
+  # load_checkpoint_path: "./checkpoints/pretrained_model.pth"
+  # load_checkpoint_path: null  # Train from scratch (default)
+
+# =============================================================================
+# 4. TRAINING CONFIGURATION  
+# =============================================================================
+
+training:
+  # Whether to train the model (set to false to use pre-trained only)
+  enabled: true
+  
+  # Number of training epochs
+  epochs: 10
+  # Alternatives based on your needs:
+  # epochs: 5    # Quick experiments
+  # epochs: 20   # More thorough training
+  # epochs: 50   # Full training for final results
+  
+  # Optimizer configuration
+  optimizer:
+    name: "Adam"
+    params:
+      # Learning rate - most important hyperparameter
+      lr: 0.001
+      # Alternative learning rates:
+      # lr: 0.0001  # Conservative, slower learning
+      # lr: 0.003   # Aggressive, faster learning
+      # lr: 0.01    # Very aggressive (may be unstable)
+      
+      # Weight decay for L2 regularization
+      weight_decay: 0.0001
+      # weight_decay: 0.0     # No weight decay
+      # weight_decay: 0.001   # Strong weight decay
+      
+      # Adam-specific parameters (usually don't need to change)
+      # betas: [0.9, 0.999]
+      # eps: 1e-8
+  
+  # Alternative optimizers:
+  # optimizer:
+  #   name: "SGD"
+  #   params:
+  #     lr: 0.01
+  #     momentum: 0.9
+  #     weight_decay: 0.0001
+  #     nesterov: true
+  
+  # Learning rate scheduler (optional but often helpful)
+  lr_scheduler:
+    name: "StepLR"
+    params:
+      step_size: 7    # Reduce LR every 7 epochs
+      gamma: 0.1      # Multiply LR by 0.1
+  
+  # Alternative schedulers:
+  # lr_scheduler:
+  #   name: "ReduceLROnPlateau"
+  #   params:
+  #     mode: 'min'
+  #     factor: 0.5
+  #     patience: 3
+  #     verbose: true
+  
+  # lr_scheduler:
+  #   name: "CosineAnnealingLR" 
+  #   params:
+  #     T_max: 10
+  
+  # lr_scheduler: null  # No scheduler
+  
+  # Loss function (automatically chosen based on task)
+  # loss_function: "CrossEntropyLoss"  # For classification
+  # loss_function: "MSELoss"           # For regression
+
+# =============================================================================
+# 5. ANALYSIS CONFIGURATION
+# =============================================================================
+
+analysis:
+  # -----------------------------------------------------------------------------
+  # 5.1 Activation Extraction Settings
+  # -----------------------------------------------------------------------------
+  activation_extraction:
+    # Which model layers to analyze (must match model architecture)
+    layers: ["layer1", "layer2", "layer3"]
+    # For different architectures, adjust accordingly:
+    # layers: ["layer1", "layer2"]              # For 2-layer models
+    # layers: ["layer1", "layer2", "layer3", "layer4"]  # For 4-layer models
+    
+    # Which dataset split to use for analysis
+    dataset_split: "test"
+    # dataset_split: "train"  # Use training data instead
+    
+    # Maximum number of samples to analyze (null = use all available)
+    max_samples: 1000
+    # max_samples: null     # Use entire dataset (slower but more complete)
+    # max_samples: 500      # Faster analysis
+    # max_samples: 5000     # More samples for better statistics
+    # max_samples: 10000    # Large-scale analysis (may be slow)
+    
+    # Whether to normalize activations before analysis
+    normalize_activations: true
+    # normalize_activations: false  # Use raw activations
+    
+    # Normalization method if normalize_activations is true
+    normalization_method: "standard"  # Z-score normalization
+    # normalization_method: "minmax"    # Min-max scaling to [0,1]
+    # normalization_method: "none"     # No normalization
+  
+  # -----------------------------------------------------------------------------
+  # 5.2 Topological Analysis Settings  
+  # -----------------------------------------------------------------------------
+  topology:
+    # Which homology dimensions to compute (affects performance)
+    homology_dimensions: [0, 1, 2]
+    # homology_dimensions: [0, 1]  # Faster - only connected components and loops
+    # homology_dimensions: [0]     # Fastest - only connected components
+    
+    # Distance metric for computing neuron similarity
+    distance_metric: "euclidean"
+    # distance_metric: "cosine"        # Good for high-dimensional data
+    # distance_metric: "manhattan"     # L1 distance
+    # distance_metric: "correlation"   # Pearson correlation distance
+    
+    # Number of filtration scales for multi-scale analysis
+    num_filtration_scales: 15
+    # num_filtration_scales: 10   # Fewer scales, faster computation
+    # num_filtration_scales: 20   # More scales, finer resolution
+    
+    # Percentile range for filtration scales
+    filtration_percentile_range: [5.0, 95.0]
+    # filtration_percentile_range: [10.0, 90.0]  # More conservative range
+  
+  # -----------------------------------------------------------------------------
+  # 5.3 Visualization Settings
+  # -----------------------------------------------------------------------------
+  visualizations:
+    # Generate t-SNE embedding plot (can be slow for large datasets)
+    tsne_plot: true
+    # tsne_plot: false  # Skip t-SNE to save time
+    
+    # Generate distance matrix heatmap
+    distance_matrix: true
+    # distance_matrix: false  # Skip if not needed
+    
+    # Generate persistence diagram
+    persistence_diagram: true
+    # persistence_diagram: false  # Skip topological plots
+    
+    # Generate neuron criticality distribution plot
+    criticality_distribution: true
+    
+    # Generate degree evolution across scales plot
+    degree_evolution: true
+    
+    # Plot configuration
+    plot_config:
+      figsize: [10, 8]    # Figure size in inches
+      dpi: 300            # Resolution for saved figures
+      style: "seaborn-v0_8-whitegrid"  # Matplotlib style
+      # Alternative styles:
+      # style: "ggplot"
+      # style: "seaborn-v0_8-darkgrid"
+      # style: "classic"
+
+# =============================================================================
+# 6. ABLATION CONFIGURATION
+# =============================================================================
+
+# Single ablation strategy configuration
+ablation:
+  # Strategy name - determines which algorithm to use
+  strategy: "homology_degree"
+  # Available strategies:
+  # - "homology_degree"      # Degree centrality at characteristic scale
+  # - "homology_persistence" # Persistence-weighted importance  
+  # - "knn_distance"         # k-nearest neighbor distance
+  # - "random"               # Random baseline
+  
+  # Step size for ablation testing (percentage points)
+  step: 5  # Test at 0%, 5%, 10%, ..., 100% removal
+  # step: 10  # Faster testing: 0%, 10%, 20%, ..., 100%
+  # step: 2   # Fine-grained: 0%, 2%, 4%, ..., 100%
+  
+  # Strategy-specific parameters
+  params:
+    # Parameters for homology-based strategies
+    homology_degree:
+      # Which homology dimension to use for ranking
+      homology_dim: 1  # H1 = loops/cycles
+      # homology_dim: 0  # H0 = connected components  
+      # homology_dim: 2  # H2 = voids (3D cavities)
+    
+    homology_persistence:
+      # Which homology dimension to use for persistence weighting
+      homology_dim: 1
+    
+    # Parameters for k-NN strategy
+    knn_distance:
+      k: 5  # Number of nearest neighbors
+      # k: 3   # Fewer neighbors, more local
+      # k: 10  # More neighbors, more global view
+    
+    # Random strategy needs no parameters
+    random: {}
+
+# Alternative: Multiple ablation strategies in one experiment
+# ablations:
+#   - strategy: "homology_degree"
+#     step: 5
+#     params:
+#       homology_degree:
+#         homology_dim: 1
+#   
+#   - strategy: "homology_degree"  
+#     step: 5
+#     params:
+#       homology_degree:
+#         homology_dim: 0
+#   
+#   - strategy: "knn_distance"
+#     step: 5  
+#     params:
+#       knn_distance:
+#         k: 5
+#   
+#   - strategy: "random"
+#     step: 5
+#     params: {}
+
+# =============================================================================
+# 7. LOGGING & EXPERIMENT TRACKING CONFIGURATION
+# =============================================================================
+
+logging:
+  # Wandb project name (will be created if doesn't exist)
+  project: "neural-topology-mnist-baseline"
+  
+  # Experiment name (auto-generated if not specified)
+  # name: "custom_experiment_name"
+  
+  # Experiment group for organizing related runs
+  group: "mnist_baseline_experiments"
+  # group: "paper_experiments"
+  # group: "ablation_comparison"
+  
+  # Additional tags beyond those in the main tags section
+  wandb_tags: 
+    - "comprehensive_config"
+    - "documented_example"
+  
+  # Experiment notes (markdown supported)
+  notes: |
+    Comprehensive MNIST baseline experiment demonstrating all configuration options.
+    
+    This experiment includes:
+    - Standard MLP architecture with dropout regularization
+    - Complete topological analysis with persistence diagrams
+    - Homology-degree ablation strategy
+    - Full visualization suite
+    
+    Configuration serves as documentation for all available options.
+  
+  # Whether to log system metrics (CPU, GPU, memory usage)
+  log_system_metrics: true
+  # log_system_metrics: false  # Skip if not needed
+  
+  # Wandb run mode
+  mode: "online"  # Upload to wandb cloud
+  # mode: "offline"  # Store locally, sync later
+  # mode: "disabled"  # No wandb logging
+
+# =============================================================================
+# 8. OUTPUT & ARTIFACT CONFIGURATION  
+# =============================================================================
+
+outputs:
+  # Base directory for any local outputs (mostly deprecated with wandb)
+  base_dir: "./experiments"
+  
+  # Whether to save model checkpoints as wandb artifacts
+  save_model_checkpoint: true
+  # save_model_checkpoint: false  # Skip if model isn't important
+  
+  # Whether to save activation tensors as artifacts (can be large)
+  save_activations: false
+  # save_activations: true  # Enable for detailed post-analysis
+  
+  # Whether to save all results as downloadable artifacts
+  save_results_csv: true
+  
+  # Artifact retention policy
+  artifact_retention_days: 90  # Keep artifacts for 90 days
+  # artifact_retention_days: 30   # Shorter retention
+  # artifact_retention_days: 365  # Long-term storage
+
+# =============================================================================
+# 9. PERFORMANCE & RESOURCE CONFIGURATION
+# =============================================================================
+
+performance:
+  # Device preference (auto-detected if not specified)
+  # device: "cuda"     # Force GPU
+  # device: "mps"      # Force Apple Silicon GPU  
+  # device: "cpu"      # Force CPU
+  
+  # Memory management
+  memory_management:
+    # Clear GPU cache between major operations
+    clear_cache: true
+    
+    # Chunk size for distance matrix computation (reduce if memory issues)
+    distance_matrix_chunk_size: 1000
+    # distance_matrix_chunk_size: 500   # For limited memory
+    # distance_matrix_chunk_size: 2000  # For ample memory
+  
+  # Parallel processing
+  parallel:
+    # Number of processes for CPU-intensive operations
+    num_processes: 4
+    # num_processes: 1   # Disable parallelism
+    # num_processes: 8   # More processes for many-core systems
+
+# =============================================================================
+# 10. ADVANCED EXPERIMENTAL OPTIONS
+# =============================================================================
+
+# Advanced configuration for research experiments
+advanced:
+  # Enable gradient-based importance computation for hybrid strategies
+  compute_gradient_importance: false
+  # compute_gradient_importance: true  # Enable for gradient analysis
+  
+  # Stratify analysis by prediction correctness
+  stratify_by_correctness: false  
+  # stratified_by_correctness: true  # Analyze correct vs incorrect separately
+  
+  # Export raw data for external analysis
+  export_raw_data: false
+  # export_raw_data: true  # Export for R, MATLAB, etc.
+  
+  # Custom analysis hooks (advanced users only)
+  custom_analysis:
+    enabled: false
+    # enabled: true
+    # custom_functions: ["my_custom_analysis_function"]
+  
+  # Experimental features (may be unstable)
+  experimental:
+    # Use sparse representations where possible
+    use_sparse_matrices: false
+    
+    # Enable experimental ablation strategies
+    enable_experimental_strategies: false
+    
+    # Advanced persistence computations
+    compute_persistent_cohomology: false
+
+# =============================================================================
+# CONFIGURATION VALIDATION & DEBUGGING
+# =============================================================================
+
+# Validation settings
+validation:
+  # Perform comprehensive config validation before starting
+  strict_validation: true
+  # strict_validation: false  # Allow some configuration warnings
+  
+  # Check system requirements (memory, disk space, etc.)
+  check_system_requirements: true
+  
+  # Validate model architecture compatibility with dataset
+  validate_model_dataset_compatibility: true
+
+# Debugging options
+debug:
+  # Verbose logging level
+  log_level: "INFO"  # Standard logging
+  # log_level: "DEBUG"   # Detailed debugging
+  # log_level: "WARNING" # Minimal logging
+  
+  # Save intermediate results for debugging
+  save_intermediate_results: false
+  # save_intermediate_results: true  # Enable for troubleshooting
+  
+  # Profile performance bottlenecks
+  enable_profiling: false
+  # enable_profiling: true  # Enable for performance optimization
