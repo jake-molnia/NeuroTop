@@ -34,7 +34,7 @@ base_config:
       normalize_activations: false # New flag for normalization
       normalization_method: "none" # Options: "standard", "minmax", "none"
     visualizations:
-      tsne_plot: false # Disable expensive plots for faster suite runs
+      tsne_plot: true # Disable expensive plots for faster suite runs
       distance_matrix: true
       persistence_diagram: false # Keep this to verify topological calculations
   outputs:

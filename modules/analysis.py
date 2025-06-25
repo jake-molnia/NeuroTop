@@ -325,7 +325,7 @@ def plot_tsne(activations, output_path):
     print("Generating t-SNE plot...")
     activations_T = activations.T.cpu().numpy()
     ic(f"t-SNE input shape: {activations_T.shape}")
-    tsne = TSNE(n_components=2, verbose=0, perplexity=30, n_iter=300, metric='euclidean')
+    tsne = TSNE(n_components=2, verbose=0, perplexity=30, metric='euclidean')
     tsne_results = tsne.fit_transform(activations_T)
     
     plt.figure(figsize=(10, 10))
@@ -346,3 +346,308 @@ def plot_distance_matrix(dist_matrix, output_path):
     plt.savefig(output_path)
     plt.close()
     ic(f"Distance matrix plot saved to {output_path}")
+
+
+def stratify_activations_by_context(model, data_loader, layers_to_hook, max_samples, device, normalize_activations=True, normalization_method="standard"):
+    """
+    Separates neuron activations based on whether the model's prediction for an input was correct or incorrect.
+    Returns a dictionary of activation dictionaries, one for 'correct' and one for 'incorrect'.
+    """
+    model.to(device)
+    model.eval()
+    
+    # --- Step 1: Get all predictions and labels first ---
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for data, labels in tqdm(data_loader, desc="Getting Predictions for Stratification"):
+            outputs = model(data.to(device))
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.append(predicted.cpu())
+            all_labels.append(labels.cpu())
+    
+    all_preds = torch.cat(all_preds)
+    all_labels = torch.cat(all_labels)
+    correct_indices = (all_preds == all_labels).nonzero(as_tuple=True)[0]
+    incorrect_indices = (all_preds != all_labels).nonzero(as_tuple=True)[0]
+
+    ic(f"Found {len(correct_indices)} correct and {len(incorrect_indices)} incorrect predictions.")
+
+    # --- Step 2: Extract activations using the indices ---
+    activations = {layer: [] for layer in layers_to_hook}
+    feature_layers = model.get_feature_layers()
+    hooks = []
+
+    def get_hook(name):
+        def hook(model, input, output):
+            activations[name].append(output.detach().cpu())
+        return hook
+
+    for layer_name in layers_to_hook:
+        layer_to_hook = feature_layers[layer_name]
+        hooks.append(layer_to_hook.register_forward_hook(get_hook(layer_name)))
+    
+    # Process the full dataset once
+    with torch.no_grad():
+        for data, _ in tqdm(data_loader, desc="Extracting Activations for Stratification"):
+            model(data.to(device))
+    
+    for hook in hooks:
+        hook.remove()
+    
+    # Concatenate all activations
+    for name, acts in activations.items():
+        activations[name] = torch.cat(acts, dim=0)
+
+    # --- Step 3: Split activations by context ---
+    stratified_activations = {'correct': {}, 'incorrect': {}}
+    for name, acts in activations.items():
+        stratified_activations['correct'][name] = acts[correct_indices]
+        stratified_activations['incorrect'][name] = acts[incorrect_indices]
+
+        if max_samples:
+            stratified_activations['correct'][name] = stratified_activations['correct'][name][:max_samples]
+            stratified_activations['incorrect'][name] = stratified_activations['incorrect'][name][:max_samples]
+            
+    # --- Step 4: Normalize within each context ---
+    for context, acts_dict in stratified_activations.items():
+        if normalize_activations:
+            ic(f"Normalizing activations for context: {context}")
+            for name, acts in acts_dict.items():
+                if acts.shape[0] == 0: continue # Skip if no samples
+                if normalization_method == "standard":
+                    scaler = StandardScaler()
+                    scaled_acts_T = scaler.fit_transform(acts.T.cpu().numpy())
+                    stratified_activations[context][name] = torch.from_numpy(scaled_acts_T.T).float()
+                # Add other normalization methods if needed
+    
+    ic("Stratified activation shapes:")
+    ic(f"Correct: {[f'{k}: {v.shape}' for k,v in stratified_activations['correct'].items()]}")
+    ic(f"Incorrect: {[f'{k}: {v.shape}' for k,v in stratified_activations['incorrect'].items()]}")
+    
+    return stratified_activations
+
+
+def get_filtration_scales(dist_matrix, num_scales=10):
+    """
+    Analyzes the distance matrix to propose multiple filtration radii based on percentiles.
+    """
+    ic(f"Calculating {num_scales} filtration scales from distance matrix.")
+    # Use only the upper triangle to avoid duplicates and diagonal zeros
+    upper_triangle = dist_matrix[np.triu_indices(dist_matrix.shape[0], k=1)]
+    percentiles = np.linspace(5, 95, num_scales) # Go from 5% to 95%
+    scales = np.percentile(upper_triangle, percentiles)
+    ic(f"Proposed scales (radii): {[f'{s:.3f}' for s in scales]}")
+    return scales
+
+
+def classify_neuron_criticality(dist_matrix, scales):
+    """
+    Classifies neurons based on their degree centrality across multiple scales.
+    Returns a DataFrame with neuron index, classification, and degree evolution.
+    """
+    num_neurons = dist_matrix.shape[0]
+    degree_evolution = np.zeros((num_neurons, len(scales)))
+
+    for i, scale in enumerate(tqdm(scales, desc="Analyzing scales")):
+        adj_matrix = (dist_matrix <= scale).astype(int)
+        np.fill_diagonal(adj_matrix, 0)
+        degree_evolution[:, i] = np.sum(adj_matrix, axis=1)
+    
+    # Normalize degree evolution for each neuron to be between 0 and 1
+    max_degrees = np.max(degree_evolution, axis=1, keepdims=True)
+    norm_degree_evolution = degree_evolution / (max_degrees + 1e-8)
+
+    classifications = []
+    for i in range(num_neurons):
+        # Heuristic for classification:
+        # 'Core': High degree even at small scales (e.g., >50% of its max degree in the first 30% of scales)
+        # 'Redundant': Low degree throughout (e.g., never reaches 20% of the network's max degree)
+        # 'Conditional': Everything else (becomes important at larger scales)
+        
+        is_core = np.any(norm_degree_evolution[i, :int(len(scales)*0.3)] > 0.5)
+        is_redundant = np.all(degree_evolution[i, :] < (np.max(degree_evolution) * 0.2))
+        
+        if is_core:
+            classifications.append('Core')
+        elif is_redundant:
+            classifications.append('Redundant')
+        else:
+            classifications.append('Conditional')
+            
+    results_df = pd.DataFrame({
+        'neuron_id': range(num_neurons),
+        'classification': classifications
+    })
+    # Add degree evolution data to the dataframe
+    for i, scale in enumerate(scales):
+        results_df[f'degree_at_scale_{i}'] = degree_evolution[:, i]
+    
+    ic(results_df['classification'].value_counts())
+    return results_df
+
+
+# --- [NEW] Phase 4: Hybrid Analysis & Fusion ---
+
+def get_gradient_importance(model, data_loader, device, layer_name):
+    """
+    Calculates neuron importance based on the magnitude of gradients flowing back to it.
+    Uses a simple L1-norm of gradients as the importance score.
+    """
+    model.to(device)
+    model.eval()
+    
+    feature_layer = model.get_feature_layers()[layer_name]
+    neuron_grads = None
+    
+    # Hook to capture gradients
+    def grad_hook(grad):
+        nonlocal neuron_grads
+        # Sum gradients across the batch dimension
+        neuron_grads = grad.abs().sum(0).cpu().numpy()
+        
+    # Register hook on the layer's weights
+    weight_handle = feature_layer.weight.register_hook(grad_hook)
+    
+    ic(f"Calculating gradient importance for layer '{layer_name}'")
+    
+    # We only need one batch to get representative gradients
+    data, labels = next(iter(data_loader))
+    data, labels = data.to(device), labels.to(device)
+    
+    model.zero_grad()
+    outputs = model(data)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    loss = loss_fn(outputs, labels)
+    loss.backward()
+    
+    weight_handle.remove() # Clean up the hook
+    
+    # The hook populates neuron_grads. The shape might be (out_features, in_features).
+    # We sum across the input features to get a single score per output neuron.
+    if neuron_grads.ndim > 1:
+        importance_scores = np.sum(neuron_grads, axis=1)
+    else:
+        importance_scores = neuron_grads
+        
+    ic(f"Gradient importance scores calculated for {len(importance_scores)} neurons.")
+    return importance_scores
+
+
+def fuse_importance_rankings(rankings_dict):
+    """
+    Combines multiple neuron ranking lists into a single consensus ranking using Borda Count.
+    Args:
+        rankings_dict: A dictionary where keys are method names and values are lists of neuron indices
+                       sorted by importance (most important first).
+    Returns:
+        A list of neuron indices sorted by the fused importance.
+    """
+    ic(f"Fusing rankings from methods: {list(rankings_dict.keys())}")
+    
+    # Get all unique neuron IDs from all rankings
+    all_neurons = set()
+    for ranking in rankings_dict.values():
+        all_neurons.update(ranking)
+    all_neurons = list(all_neurons)
+    num_neurons = len(all_neurons)
+
+    # Borda Count: score is (num_neurons - rank). Higher score is better.
+    borda_scores = {neuron: 0 for neuron in all_neurons}
+    
+    for method, ranking in rankings_dict.items():
+        for i, neuron_id in enumerate(ranking):
+            rank = i + 1
+            score = num_neurons - rank
+            borda_scores[neuron_id] += score
+            
+    # Sort neurons by their final Borda score in descending order
+    fused_ranking_df = pd.DataFrame(list(borda_scores.items()), columns=['neuron_id', 'borda_score'])
+    fused_ranking_df = fused_ranking_df.sort_values('borda_score', ascending=False)
+    
+    ic("Top 5 neurons in fused ranking:")
+    ic(fused_ranking_df.head())
+    
+    return fused_ranking_df['neuron_id'].tolist()
+
+
+# --- [NEW] Visualization for Advanced Analysis ---
+
+def plot_criticality_distribution(criticality_df, output_path):
+    """
+    Plots a bar chart showing the distribution of neuron classifications.
+    """
+    plt.figure(figsize=(8, 6))
+    ax = sns.countplot(x='classification', data=criticality_df, palette='viridis', order=['Core', 'Conditional', 'Redundant'])
+    plt.title("Distribution of Neuron Criticality", fontsize=16)
+    plt.xlabel("Neuron Classification", fontsize=12)
+    plt.ylabel("Number of Neurons", fontsize=12)
+    for p in ax.patches:
+        ax.annotate(f'{p.get_height()}', (p.get_x() + p.get_width() / 2., p.get_height()),
+                    ha='center', va='center', xytext=(0, 9), textcoords='offset points')
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    ic(f"Criticality distribution plot saved to {output_path}")
+
+def plot_degree_evolution(criticality_df, scales, output_path, num_to_plot=10):
+    """
+    Plots the degree evolution for a sample of neurons from each class.
+    """
+    plt.figure(figsize=(12, 8))
+    
+    for classification in ['Core', 'Conditional', 'Redundant']:
+        subset_df = criticality_df[criticality_df['classification'] == classification]
+        if len(subset_df) == 0: continue
+        
+        sample_indices = subset_df.sample(n=min(num_to_plot, len(subset_df))).index
+        
+        degree_cols = [col for col in criticality_df.columns if 'degree_at_scale' in col]
+        for idx in sample_indices:
+            plt.plot(scales, criticality_df.loc[idx, degree_cols],
+                     label=f"{classification} Neuron" if idx == sample_indices[0] else None, # Label only once per class
+                     alpha=0.6)
+
+    plt.title("Evolution of Neuron Degree Across Filtration Scales", fontsize=16)
+    plt.xlabel("Filtration Radius (Scale)", fontsize=12)
+    plt.ylabel("Neuron Degree (Number of Connections)", fontsize=12)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    ic(f"Degree evolution plot saved to {output_path}")
+
+def plot_ranking_comparison(ranking1, ranking2, name1, name2, output_path):
+    """
+    Generates a scatter plot to compare two neuron importance rankings.
+    """
+    # Create a mapping from neuron_id to its rank for each list
+    rank1_map = {neuron_id: i for i, neuron_id in enumerate(ranking1)}
+    rank2_map = {neuron_id: i for i, neuron_id in enumerate(ranking2)}
+    
+    all_neurons = list(set(ranking1) | set(ranking2))
+    
+    plot_data = []
+    for neuron_id in all_neurons:
+        plot_data.append({
+            'neuron_id': neuron_id,
+            'rank1': rank1_map.get(neuron_id, len(all_neurons)),
+            'rank2': rank2_map.get(neuron_id, len(all_neurons))
+        })
+    df = pd.DataFrame(plot_data)
+    
+    plt.figure(figsize=(10, 10))
+    sns.scatterplot(data=df, x='rank1', y='rank2', alpha=0.7)
+    # Add a y=x line for reference
+    plt.plot([0, len(all_neurons)], [0, len(all_neurons)], color='r', linestyle='--', label='Perfect Agreement')
+    
+    plt.title(f"Comparison of Neuron Rankings: {name1} vs. {name2}", fontsize=16)
+    plt.xlabel(f"Rank by {name1} Importance", fontsize=12)
+    plt.ylabel(f"Rank by {name2} Importance", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    ic(f"Ranking comparison plot saved to {output_path}")
