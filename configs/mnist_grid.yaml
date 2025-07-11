@@ -1,0 +1,132 @@
+# MNIST Model Grid - Following the comprehensive baseline structure
+base_config:
+  seed: 42
+  description: "MNIST model grid for topology analysis"
+  tags: 
+    - "mnist"
+    - "grid" 
+    - "topology"
+  
+  dataset:
+    name: "MNIST"
+    path: "./data"
+    batch_size: 128
+    num_workers: 4
+  
+  training:
+    enabled: true
+    epochs: 8  # Quick training for grid
+    optimizer:
+      name: "Adam"
+      params:
+        lr: 0.001
+        weight_decay: 0.0001
+    lr_scheduler:
+      name: "StepLR"
+      params:
+        step_size: 5
+        gamma: 0.1
+  
+  analysis:
+    activation_extraction:
+      layers: ["layer1", "layer2", "layer3"]
+      dataset_split: "test"
+      max_samples: 3000  # Faster for grid
+      normalize_activations: true
+      normalization_method: "standard"
+    
+    topology:
+      homology_dimensions: [0, 1, 2]
+      distance_metric: "euclidean"
+      num_filtration_scales: 15
+      filtration_percentile_range: [5.0, 95.0]
+    
+    visualizations:
+      tsne_plot: true
+      distance_matrix: true
+      persistence_diagram: true
+      criticality_distribution: true
+      degree_evolution: true
+      plot_config:
+        figsize: [10, 8]
+        dpi: 300
+        style: "seaborn-v0_8-whitegrid"
+  
+  logging:
+    project: "neural-topology-grid"
+    group: "model_grid_experiments"
+    wandb_tags:
+      - "model_grid"
+      - "comprehensive"
+    notes: |
+      MNIST model architecture grid experiment.
+      
+      Testing different MLP configurations:
+      - Various hidden layer sizes
+      - Batch normalization effects  
+      - Dropout regularization levels
+      
+      Each model gets complete topological analysis.
+    log_system_metrics: true
+    mode: "online"
+  
+  outputs:
+    base_dir: "./grid_experiments"
+    save_model_checkpoint: true
+    save_activations: false
+    save_results_csv: true
+    artifact_retention_days: 90
+  
+  performance:
+    memory_management:
+      clear_cache: true
+      distance_matrix_chunk_size: 1000
+    parallel:
+      num_processes: 4
+  
+  validation:
+    strict_validation: true
+    check_system_requirements: true
+    validate_model_dataset_compatibility: true
+  
+  debug:
+    log_level: "INFO"
+    save_intermediate_results: false
+    enable_profiling: false
+
+# Grid of different model architectures to compare
+models:
+  - name: "Small_MLP"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: false
+      dropout_rate: 0.3
+      hidden_sizes: [256, 128]
+  
+  - name: "Medium_MLP"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: false
+      dropout_rate: 0.3
+      hidden_sizes: [512, 256, 128]
+  
+  - name: "Large_MLP"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: false
+      dropout_rate: 0.3
+      hidden_sizes: [1024, 512, 256]
+  
+  - name: "BatchNorm_MLP"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: true
+      dropout_rate: 0.3
+      hidden_sizes: [512, 256, 128]
+  
+  - name: "HighDropout_MLP"
+    architecture: "MNIST_MLP"
+    params:
+      use_batchnorm: false
+      dropout_rate: 0.7
+      hidden_sizes: [512, 256, 128]
