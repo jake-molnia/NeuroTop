@@ -1,2 +1,3 @@
 from .distances import compute_distances, available_metrics
 from .persistence import compute_persistence, extract_betti_numbers, PersistenceAnalyzer
+from .evolution import EvolutionTracker, compute_topology_distance, detect_phase_transitions
