@@ -250,3 +250,81 @@ def compute_gradient_importance(
         return importance_scores
     else:
         raise RuntimeError(f"Could not compute gradients for layer {layer_name}")
+class FlowAwareTrainer:
+    """Enhanced trainer with temporal activation capture."""
+    
+    def __init__(self, model, config, temporal_storage=None, experiment_id=None):
+        self.model = model
+        self.config = config
+        self.temporal_storage = temporal_storage
+        self.experiment_id = experiment_id
+        self.capture_epochs = config.get('temporal_analysis', {}).get('capture_epochs', [])
+    
+    def should_capture(self, epoch):
+        return epoch in self.capture_epochs
+    
+    def capture_activations(self, model, data_loader, layers, epoch, max_samples, device):
+        """Capture activations for temporal analysis."""
+        if not self.should_capture(epoch) or not self.temporal_storage:
+            return
+            
+        from .activations import extract_activations
+        activations = extract_activations(model, data_loader, layers, max_samples, device)
+        self.temporal_storage.capture_epoch(
+            self.experiment_id, 
+            epoch, 
+            activations,
+            run_flow_analysis=True
+        )
+        
+    def train_with_flow_monitoring(self, train_loader, test_loader, device, exp_logger=None):
+        """Train model with flow monitoring and temporal capture."""
+        
+        # Setup optimizer and scheduler
+        from torch import optim
+        opt_config = self.config['training']['optimizer']
+        optimizer_class = getattr(optim, opt_config['name'])
+        optimizer = optimizer_class(self.model.parameters(), **opt_config['params'])
+        
+        scheduler = None
+        if 'lr_scheduler' in self.config['training']:
+            sched_config = self.config['training']['lr_scheduler']
+            scheduler_class = getattr(optim.lr_scheduler, sched_config['name'])
+            scheduler = scheduler_class(optimizer, **sched_config['params'])
+        
+        self.model.to(device)
+        epochs = self.config['training']['epochs']
+        
+        from .training import train_epoch, evaluate
+        
+        for epoch in range(1, epochs + 1):
+            # Training phase
+            train_loss, train_acc = train_epoch(self.model, train_loader, optimizer, device, epoch)
+            
+            # Learning rate scheduling
+            if scheduler:
+                scheduler.step()
+            
+            # Evaluation phase
+            test_loss, test_acc = evaluate(self.model, test_loader, device)
+            
+            # Capture activations if this is a capture epoch
+            if self.should_capture(epoch):
+                analysis_config = self.config['analysis']['activation_extraction']
+                self.capture_activations(
+                    self.model, test_loader, analysis_config['layers'], 
+                    epoch, analysis_config.get('max_samples'), device
+                )
+            
+            # Log to experiment tracker
+            if exp_logger:
+                metrics = {
+                    'train/loss': train_loss,
+                    'train/accuracy': train_acc,
+                    'test/loss': test_loss,
+                    'test/accuracy': test_acc,
+                    'train/learning_rate': optimizer.param_groups[0]['lr']
+                }
+                exp_logger.log_metrics(metrics, step=epoch)
+        
+        return self.model

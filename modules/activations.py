@@ -168,3 +168,35 @@ def _get_activation_summary(activations: Dict[str, torch.Tensor]) -> str:
     for name, acts in activations.items():
         summary.append(f"{name}: {acts.shape}")
     return ", ".join(summary)
+class TemporalActivationExtractor:
+    def __init__(self, capture_epochs=None):
+        self.capture_epochs = capture_epochs or []
+
+def extract_activations_at_intervals(model, data_loader, layers_to_hook, epochs, max_samples=None, device=torch.device('cpu'), normalize_method='standard'):
+    temporal_activations = {}
+    for epoch in epochs:
+        activations = extract_activations(model, data_loader, layers_to_hook, max_samples, device)
+        if normalize_method != 'none':
+            activations = normalize_activations(activations, normalize_method)
+        temporal_activations[epoch] = activations
+    return temporal_activations
+
+def track_activation_evolution(temporal_activations, similarity_method='cosine'):
+    evolution = {}
+    epochs = sorted(temporal_activations.keys())
+    if len(epochs) < 2:
+        return evolution
+    
+    layer_names = list(temporal_activations[epochs[0]].keys())
+    for layer_name in layer_names:
+        evolution[layer_name] = []
+        for i in range(1, len(epochs)):
+            prev_acts = temporal_activations[epochs[i-1]][layer_name]
+            curr_acts = temporal_activations[epochs[i]][layer_name]
+            if similarity_method == 'cosine':
+                similarity = torch.nn.functional.cosine_similarity(
+                    prev_acts.flatten().unsqueeze(0), 
+                    curr_acts.flatten().unsqueeze(0)
+                ).item()
+            evolution[layer_name].append(similarity)
+    return evolution

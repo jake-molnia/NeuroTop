@@ -296,3 +296,94 @@ def create_experiment_summary_plots(
     
     logger.info(f"Created {len(plots)} summary plots")
     return plots
+
+def plot_flow_evolution(temporal_data, title="Flow Evolution"):
+    """Plot evolution of flow metrics over training."""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    epochs = sorted(temporal_data.keys())
+    
+    # Energy evolution
+    energies = [temporal_data[epoch]['energies']['total'] for epoch in epochs]
+    axes[0, 0].plot(epochs, energies, 'o-', linewidth=2)
+    axes[0, 0].set_title('Energy Evolution')
+    
+    # Betti numbers
+    for dim in [0, 1, 2]:
+        betti_values = [temporal_data[epoch]['betti_numbers'].get(dim, 0) for epoch in epochs]
+        axes[0, 1].plot(epochs, betti_values, 'o-', label=f'H{dim}')
+    axes[0, 1].set_title('Topological Evolution')
+    axes[0, 1].legend()
+    
+    plt.tight_layout()
+    return fig
+
+def plot_transport_heatmap(transport_plan, title="Transport Matrix"):
+    """Plot transport matrix as heatmap."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(transport_plan, cmap='viridis')
+    plt.colorbar(im, label='Transport Probability')
+    ax.set_title(title)
+    return fig
+
+def plot_energy_landscape(activations, energy_values, title="Energy Landscape"):
+    """Plot 3D energy landscape."""
+    from mpl_toolkits.mplot3d import Axes3D
+    from sklearn.decomposition import PCA
+    
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    pca = PCA(n_components=2)
+    coords_2d = pca.fit_transform(activations)
+    
+    scatter = ax.scatter(coords_2d[:, 0], coords_2d[:, 1], energy_values, c=energy_values, cmap='viridis')
+    plt.colorbar(scatter)
+    ax.set_title(title)
+    return fig
+
+def plot_wasserstein_flow_evolution(temporal_data, title="Wasserstein Flow Evolution", config=DEFAULT_CONFIG):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    epochs = sorted(temporal_data.keys())
+    
+    energies = [temporal_data[epoch]['energies']['total'] for epoch in epochs]
+    axes[0, 0].plot(epochs, energies, 'o-', linewidth=2)
+    axes[0, 0].set_title('Energy Evolution')
+    
+    plt.tight_layout()
+    return fig
+
+def plot_transport_matrix_heatmap(transport_plan, title="Transport Matrix", config=DEFAULT_CONFIG):
+    fig, ax = plt.subplots(figsize=config.figsize)
+    im = ax.imshow(transport_plan, cmap='viridis')
+    plt.colorbar(im)
+    ax.set_title(title)
+    return fig
+
+def plot_energy_landscape_3d(activations, energy_values, title="Energy Landscape", config=DEFAULT_CONFIG):
+    from mpl_toolkits.mplot3d import Axes3D
+    fig = plt.figure(figsize=config.figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(activations[:, 0], activations[:, 1], energy_values, c=energy_values, cmap='viridis')
+    ax.set_title(title)
+    return fig
+
+def plot_geodesic_interpolation(interpolation_points, title="Geodesic Interpolation", config=DEFAULT_CONFIG):
+    fig, ax = plt.subplots(figsize=config.figsize)
+    ax.plot([p.mean().item() for p in interpolation_points], 'o-')
+    ax.set_title(title)
+    return fig
+
+def plot_information_bottlenecks(flow_analysis, title="Information Bottlenecks", config=DEFAULT_CONFIG):
+    fig, ax = plt.subplots(figsize=config.figsize)
+    costs = [analysis['transport_cost'] for analysis in flow_analysis.values()]
+    ax.bar(range(len(costs)), costs)
+    ax.set_title(title)
+    return fig
+
+def create_flow_animation(temporal_data, output_path, metric='energy', fps=2):
+    return output_path
+
+def create_comprehensive_flow_plots(temporal_data, flow_analyses=None, config=DEFAULT_CONFIG):
+    plots = {}
+    plots['flow_evolution'] = plot_wasserstein_flow_evolution(temporal_data, config=config)
+    return plots
