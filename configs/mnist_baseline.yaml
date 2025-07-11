@@ -1,0 +1,183 @@
+# =============================================================================
+# MNIST FLOW BASELINE CONFIGURATION
+# Enhanced configuration with Wasserstein flow analysis capabilities
+# =============================================================================
+
+seed: 42
+description: "MNIST baseline with comprehensive flow analysis"
+tags: 
+  - "mnist"
+  - "flow_analysis" 
+  - "wasserstein"
+  - "temporal"
+
+# =============================================================================
+# DATASET CONFIGURATION
+# =============================================================================
+dataset:
+  name: "MNIST"
+  path: "./data"
+  batch_size: 128
+  num_workers: 4
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+model:
+  name: "MLP_Flow_Baseline"
+  architecture: "MNIST_MLP"
+  params:
+    use_batchnorm: false
+    dropout_rate: 0.5
+    hidden_sizes: [512, 256, 128]
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+training:
+  enabled: true
+  epochs: 30
+  optimizer:
+    name: "Adam"
+    params:
+      lr: 0.001
+      weight_decay: 0.0001
+  lr_scheduler:
+    name: "StepLR"
+    params:
+      step_size: 10
+      gamma: 0.5
+
+# =============================================================================
+# TEMPORAL ANALYSIS CONFIGURATION (NEW)
+# =============================================================================
+temporal_analysis:
+  enabled: true
+  capture_epochs: [1, 5, 10, 15, 20, 25, 30]  # Which epochs to capture
+  monitor_flow: true  # Real-time flow monitoring during training
+  storage_backend: "hybrid"  # local + wandb
+
+# =============================================================================
+# FLOW ANALYSIS CONFIGURATION (NEW)
+# =============================================================================
+flow_analysis:
+  wasserstein_enabled: true
+  transport_method: "sinkhorn"  # or "exact"
+  sinkhorn_regularization: 0.1
+  max_iterations: 1000
+  
+  energy_functionals:
+    - type: "diversity"
+      weight: 1.0
+    - type: "transport_cost"
+      weight: 0.5
+  
+  inter_layer_analysis: true
+  geodesic_interpolation: true
+
+# =============================================================================
+# ENHANCED ANALYSIS CONFIGURATION
+# =============================================================================
+analysis:
+  activation_extraction:
+    layers: ["layer1", "layer2", "layer3"]
+    dataset_split: "test"
+    max_samples: 2000  # Increased for better flow analysis
+    normalize_activations: true
+    normalization_method: "standard"
+  
+  topology:
+    homology_dimensions: [0, 1, 2]
+    distance_metric: "euclidean"  # Will be augmented with Wasserstein
+    num_filtration_scales: 15
+    filtration_percentile_range: [5.0, 95.0]
+  
+  visualizations:
+    # Standard plots
+    tsne_plot: true
+    distance_matrix: true
+    persistence_diagram: true
+    criticality_distribution: true
+    degree_evolution: true
+    
+    # Flow plots (NEW)
+    flow_evolution: true
+    transport_heatmaps: true
+    energy_landscapes: true
+    geodesic_paths: true
+    information_bottlenecks: true
+    create_animations: true
+
+# =============================================================================
+# STORAGE CONFIGURATION (NEW)
+# =============================================================================
+storage:
+  local_cache_dir: "./flow_cache"
+  max_cache_size_gb: 10.0
+  compression_level: 6
+  cleanup_policy: "lru"
+  
+  # What to store locally vs wandb
+  local_storage:
+    - "temporal_activations"
+    - "transport_matrices"
+    - "flow_trajectories"
+  
+  wandb_storage:
+    - "flow_metrics"
+    - "visualizations"
+    - "experiment_metadata"
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+logging:
+  project: "neural-topology-flow"
+  tags: ["flow_baseline", "mnist"]
+  group: "baseline_experiments"
+  
+  notes: |
+    Enhanced MNIST baseline with comprehensive Wasserstein flow analysis.
+    
+    Features:
+    - Temporal activation capture during training
+    - Wasserstein distance computations
+    - Energy functional evolution tracking
+    - Inter-layer information flow analysis
+    - Real-time flow monitoring
+    
+    This experiment demonstrates the full capabilities of the flow analysis framework.
+  
+  log_system_metrics: true
+  mode: "online"
+
+# =============================================================================
+# PERFORMANCE CONFIGURATION
+# =============================================================================
+performance:
+  memory_management:
+    clear_cache: true
+    distance_matrix_chunk_size: 1000
+  
+  parallel:
+    num_processes: 4
+  
+  # Flow-specific optimizations
+  flow_optimizations:
+    cache_transport_plans: true
+    use_sparse_matrices: true
+    batch_wasserstein_computation: true
+
+# =============================================================================
+# OUTPUTS CONFIGURATION
+# =============================================================================
+outputs:
+  base_dir: "./experiments"
+  save_model_checkpoint: true
+  save_activations: false  # Using temporal storage instead
+  save_results_csv: true
+  
+  # Flow-specific outputs
+  save_flow_analysis: true
+  export_temporal_data: false  # Keep in cache
+  create_summary_report: true
