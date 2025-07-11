@@ -8,5 +8,6 @@ from .analysis.evolution import EvolutionTracker
 from .viz.plots import plot_persistence_diagram
 from .viz.temporal import plot_betti_evolution, create_training_summary
 from .data.mnist import get_mnist_loaders, create_simple_mnist_model
+from .data.fashion_mnist import get_fashion_mnist_loaders, create_simple_fashion_mnist_model
 
 __version__ = "0.1.0"
