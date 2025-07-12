@@ -91,6 +91,35 @@ def _extract_betti_numbers(persistence_result: Dict) -> Dict[int, int]:
             betti[dim] = np.sum(infinite_features)
     return betti
 
+def _compute_per_neuron_rf(activations: Dict[str, torch.Tensor], distance_metric: str = 'euclidean') -> Dict[str, np.ndarray]:
+    """Compute rf values for each neuron in each layer"""
+    rf_values = {}
+    for layer_name, layer_acts in activations.items():
+        if layer_acts.dim() > 2: layer_acts = layer_acts.flatten(1)
+        n_samples, n_neurons = layer_acts.shape
+        neuron_rf_values = np.zeros(n_neurons)
+        
+        for neuron_idx in range(n_neurons):
+            neuron_activations = layer_acts[:, neuron_idx].cpu().numpy().reshape(-1, 1)
+            if np.std(neuron_activations) < 1e-10:
+                neuron_rf_values[neuron_idx] = 0.0
+                continue
+            
+            distance_matrix = _compute_distances(torch.tensor(neuron_activations.T), distance_metric)
+            persistence = _compute_persistence(distance_matrix, max_dim=1)
+            
+            # Extract rf value (max death time in dimension 0)
+            diagram_0 = persistence['dgms'][0]
+            if len(diagram_0) == 0:
+                neuron_rf_values[neuron_idx] = 0.0
+            else:
+                finite_mask = ~np.isinf(diagram_0[:, 1])
+                finite_deaths = diagram_0[finite_mask, 1]
+                neuron_rf_values[neuron_idx] = float(finite_deaths.max()) if len(finite_deaths) > 0 else 0.0
+        
+        rf_values[layer_name] = neuron_rf_values
+    return rf_values
+
 def analyze(activations: Dict[str, torch.Tensor], 
            distance_metric: str = 'euclidean', 
            max_dim: int = 2,
@@ -98,16 +127,19 @@ def analyze(activations: Dict[str, torch.Tensor],
            normalize_activations: str = 'none',
            persistence_threshold: float = 0.0,
            random_seed: Optional[int] = None,
-           filter_inactive_neurons: bool = False) -> Dict[str, Any]:
+           filter_inactive_neurons: bool = False,
+           ) -> Dict[str, Any]:
     assert activations, "Activations dictionary cannot be empty"    
     if filter_inactive_neurons: activations = _filter_inactive_neurons(activations)
     activations = _normalize_activations(activations, normalize_activations)    
     unified = _unify_neuron_space(activations, max_samples, random_seed)
     distance_matrix = _compute_distances(unified['neuron_matrix'], distance_metric)
     persistence = _compute_persistence(distance_matrix, max_dim)
+    rf_values = _compute_per_neuron_rf(activations, distance_metric)
     if persistence_threshold > 0: persistence = _filter_persistence(persistence, persistence_threshold)
     betti_numbers = _extract_betti_numbers(persistence)
-    return {
+    
+    result = {
         'neuron_matrix': unified['neuron_matrix'].cpu().numpy(),
         'neuron_info': unified['neuron_info'],
         'distance_matrix': distance_matrix,
@@ -115,5 +147,8 @@ def analyze(activations: Dict[str, torch.Tensor],
         'betti_numbers': betti_numbers,
         'total_neurons': unified['total_neurons'],
         'n_samples': unified['n_samples'],
-        'distance_metric': distance_metric
+        'distance_metric': distance_metric,
+        'rf_values' : rf_values
     }
+        
+    return result

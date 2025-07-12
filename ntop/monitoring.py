@@ -32,7 +32,7 @@ class ActivationMonitor:
             'output_file': output_file,
             'analysis_kwargs': analysis_kwargs
         }
-        self.analysis_results = []
+        self.topology_states = []
     
     def analyze(self, test_loader: DataLoader, epoch: int, description: str = "", 
                 save: bool = False) -> Dict[str, Any]:
@@ -50,36 +50,92 @@ class ActivationMonitor:
         from . import analysis
         params = {**self.analysis_config['analysis_kwargs']}
         state = analysis.analyze(activations, **params)
-        if description: print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}")
-        should_save = save
-        
-        if should_save:
-            analysis_data = {
-                'epoch': epoch,
-                'betti_numbers': state['betti_numbers'],
-                'total_neurons': state['total_neurons'],
-                'n_samples': state['n_samples'],
-                'distance_metric': state['distance_metric']
-            }
-            self.analysis_results.append(analysis_data)
+        rf_info = self._format_rf_output(state)
+        if description: print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}{rf_info}")
+        if save:
+            topology_data = self._prepare_save_data(state, epoch)
+            self.topology_states.append(topology_data)
             self._save_analysis()
-        
         return state
+    
+    def _format_rf_output(self, state: Dict[str, Any]) -> str:
+        """Format rf information for console output"""
+        if 'rf_values' not in state: return ""
+        rf_values = state['rf_values']
+        # Compute overall median rf across all layers
+        all_rf_values = []
+        for layer_rf in rf_values.values():
+            all_rf_values.extend(layer_rf)
+        if all_rf_values:
+            overall_median = np.median(all_rf_values)
+            return f", rf_median: {overall_median:.4f}"
+        return ""
         
     def _save_analysis(self):
-        assert self.analysis_results, "No analysis results to save"
-            
+        assert self.topology_states, "No topology states to save"
+        
         data = {
-            'epochs': np.array([r['epoch'] for r in self.analysis_results]),
-            'betti_numbers': [r['betti_numbers'] for r in self.analysis_results],
-            'total_neurons': np.array([r['total_neurons'] for r in self.analysis_results]),
-            'n_samples': np.array([r['n_samples'] for r in self.analysis_results]),
+            'epochs': np.array([s['epoch'] for s in self.topology_states]),
+            'topology_states': self.topology_states,
             'config': self.analysis_config
         }
-        np.savez(self.analysis_config['output_file'], **data)
+        np.savez_compressed(self.analysis_config['output_file'], **data)
     
     def load_analysis(self, filepath: str) -> Dict[str, Any]: return dict(np.load(filepath, allow_pickle=True))
     
+    def get_rf_evolution(self) -> Dict[str, Any]:
+        """Get evolution of rf values over epochs"""
+        assert self.topology_states, "No topology states available. Run analysis with save=True first."
+        epochs = [s['epoch'] for s in self.topology_states]
+        rf_evolution = {'epochs': epochs}
+        
+        if not self.topology_states: return rf_evolution
+        
+        # Get layer names from first state
+        first_rf_values = self.topology_states[0].get('rf_values', {})
+        layer_names = list(first_rf_values.keys())
+        
+        # Collect rf statistics over time
+        rf_stats_evolution = {}
+        for layer in layer_names:
+            rf_stats_evolution[layer] = {
+                'mean': [],
+                'median': [],
+                'std': []
+            }
+            for state in self.topology_states:
+                layer_rf = state.get('rf_values', {}).get(layer, np.array([]))
+                if len(layer_rf) > 0:
+                    rf_stats_evolution[layer]['mean'].append(np.mean(layer_rf))
+                    rf_stats_evolution[layer]['median'].append(np.median(layer_rf))
+                    rf_stats_evolution[layer]['std'].append(np.std(layer_rf))
+                else:
+                    rf_stats_evolution[layer]['mean'].append(0.0)
+                    rf_stats_evolution[layer]['median'].append(0.0)
+                    rf_stats_evolution[layer]['std'].append(0.0)
+        
+        rf_evolution['rf_stats_evolution'] = rf_stats_evolution
+        return rf_evolution
+
+    def _prepare_save_data(self, state: Dict[str, Any], epoch: int) -> Dict[str, Any]:
+        """Prepare topology data for saving"""
+        topology_data = {
+            'epoch': epoch,
+            'neuron_matrix': state['neuron_matrix'],
+            'neuron_info': state['neuron_info'],
+            'distance_matrix': state['distance_matrix'],
+            'persistence': state['persistence'],
+            'betti_numbers': state['betti_numbers'],
+            'total_neurons': state['total_neurons'],
+            'n_samples': state['n_samples'],
+            'distance_metric': state['distance_metric']
+        }
+        
+        if 'rf_values' in state:
+            topology_data['rf_values'] = state['rf_values']
+        
+        return topology_data
+
     def remove_hooks(self):
         for handle in self.hooks:
             handle.remove()
