@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Any
 from torch.utils.data import DataLoader
+import numpy as np
 
 
 class ActivationMonitor:
@@ -10,7 +11,6 @@ class ActivationMonitor:
         self.model = model
         self.activations = {}
         self.hooks = []
-        self.snapshots = []
         self._register_hooks()
     
     def _register_hooks(self):
@@ -27,37 +27,58 @@ class ActivationMonitor:
         assert self.activations, "No activations captured. Run a forward pass first."
         return self.activations.copy()
     
-    def capture_snapshot(self, dataloader: DataLoader, epoch: int, max_samples: int = 500):
-        self.model.eval()
-        all_activations = {}
-        with torch.no_grad():
-            samples_collected = 0
-            for batch_idx, (x, _) in enumerate(dataloader):
-                if samples_collected >= max_samples:  break
-                x = x.to(next(self.model.parameters()).device)
-                _ = self.model(x)
-                batch_size = x.size(0)
-                for name, acts in self.activations.items():
-                    if name not in all_activations: all_activations[name] = []
-                    all_activations[name].append(acts.cpu())
-                samples_collected += batch_size
-        unified_activations = {
-            name: torch.cat(acts_list, dim=0)[:max_samples] 
-            for name, acts_list in all_activations.items()
+    def set_config(self, output_file: str, **analysis_kwargs):
+        self.analysis_config = {
+            'output_file': output_file,
+            'analysis_kwargs': analysis_kwargs
         }
-        snapshot = {
-            'epoch': epoch,
-            'activations': unified_activations,
-            'samples_used': min(samples_collected, max_samples)
-        }
-        self.snapshots.append(snapshot)
+        self.analysis_results = []
     
-    def get_evolution(self) -> Dict[str, Any]:
-        assert self.snapshots, "No snapshots captured. Use capture_snapshot() during training."
-        return {
-            'epochs': [s['epoch'] for s in self.snapshots],
-            'snapshots': self.snapshots
+    def analyze(self, test_loader: DataLoader, epoch: int, description: str = "", 
+                save: bool = False) -> Dict[str, Any]:
+        assert hasattr(self, 'analysis_config'), "Analysis configuration not set. Use set_config() to configure analysis."        
+            
+        # Run the topology analysis
+        device = next(self.model.parameters()).device
+        self.model.eval()
+        with torch.no_grad():
+            data_batch = next(iter(test_loader))
+            data = data_batch[0].to(device)
+            _ = self.model(data)
+        activations = self.get_activations()
+        
+        from . import analysis
+        params = {**self.analysis_config['analysis_kwargs']}
+        state = analysis.analyze(activations, **params)
+        if description: print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}")
+        should_save = save
+        
+        if should_save:
+            analysis_data = {
+                'epoch': epoch,
+                'betti_numbers': state['betti_numbers'],
+                'total_neurons': state['total_neurons'],
+                'n_samples': state['n_samples'],
+                'distance_metric': state['distance_metric']
+            }
+            self.analysis_results.append(analysis_data)
+            self._save_analysis()
+        
+        return state
+        
+    def _save_analysis(self):
+        assert self.analysis_results, "No analysis results to save"
+            
+        data = {
+            'epochs': np.array([r['epoch'] for r in self.analysis_results]),
+            'betti_numbers': [r['betti_numbers'] for r in self.analysis_results],
+            'total_neurons': np.array([r['total_neurons'] for r in self.analysis_results]),
+            'n_samples': np.array([r['n_samples'] for r in self.analysis_results]),
+            'config': self.analysis_config
         }
+        np.savez(self.analysis_config['output_file'], **data)
+    
+    def load_analysis(self, filepath: str) -> Dict[str, Any]: return dict(np.load(filepath, allow_pickle=True))
     
     def remove_hooks(self):
         for handle in self.hooks:

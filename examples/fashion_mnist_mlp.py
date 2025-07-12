@@ -61,29 +61,11 @@ def evaluate(model, test_loader, device):
             correct += (predicted == target).sum().item()
     return 100 * correct / total
 
-def analyze_state(model, test_loader, device, monitor, epoch, description):
-    model.eval()
-    with torch.no_grad():
-        data_batch = next(iter(test_loader))
-        data = data_batch[0].to(device)
-        _ = model(data)
-    activations = monitor.get_activations()
-    state = analysis.analyze(activations, 
-                        max_samples=1500, 
-                        distance_metric='euclidean', # 'euclidean', 'cosine', 'manhattan'
-                        normalize_activations='none', # 'none', 'l2', 'zscore', 'minmax'
-                        max_dim=1, # homology dimension (larger then 3 is HARD to compute)
-                        random_seed=42,        # The answer to life, the universe, and everything
-                        filter_inactive_neurons=True,  # Clean data
-                        persistence_threshold=0.01)    # Filter noise
-    print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}")
-    return state
-
 
 def main():
     print("Fashion-MNIST MLP homology")
     print("="*50)
-    output_folder = './outputs/fashion_mnist_analysis'
+    output_folder = './outputs/fashion_mnist_MLP'
     import os
     os.makedirs(output_folder, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -96,8 +78,19 @@ def main():
     monitor = monitoring.ActivationMonitor(model)
     print("Monitor initialized")
     
+    monitor.set_config(
+        output_file=f'{output_folder}/topology_evolution.npz',
+        max_samples=1500,
+        distance_metric='euclidean',
+        normalize_activations='none',
+        max_dim=1,
+        random_seed=42,
+        filter_inactive_neurons=True,
+        persistence_threshold=0.01
+    )
+    
     print("\n" + "="*50)
-    initial_state= analyze_state(model, test_loader, device, monitor, 0, "INITIAL STATE")
+    initial_state = monitor.analyze(test_loader, 0, "INITIAL STATE")
     
     print("\nGenerating initial topology visualizations...")
     figs = [
@@ -115,13 +108,11 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
-    epochs = 20
-    monitor_freq = 1 # Highest computational contirubitor
+    epochs = 5
     
     print(f"\nStarting training for {epochs} epochs...")
 
     best_accuracy = 0
-    topology_snapshots = []
     
     for epoch in range(epochs):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
@@ -130,19 +121,14 @@ def main():
         
         if epoch % 5 == 0 or epoch == epochs - 1:
             print(f"Epoch {epoch:2d}: Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
-        
-        #F FIXME: this shoud be more efficient, but it is the highest computational contributor
-        # if epoch % monitor_freq == 0 or epoch == epochs - 1:
-        #     monitor.capture_snapshot(test_loader, epoch, max_samples=300)
-            # current_topology = analyze_state(model, test_loader, device, monitor, epoch, f"  Topology")
-            # topology_snapshots.append((epoch, current_topology))
-        
+
+        monitor.analyze(test_loader, epoch, save=True)
         if test_acc > best_accuracy: best_accuracy = test_acc
     
     print(f"\nTraining complete! Best test accuracy: {best_accuracy:.2f}%")
     
     print("\n" + "="*50)
-    final_topology = analyze_state(model, test_loader, device, monitor, epochs-1, "FINAL STATE")
+    final_topology = monitor.analyze(test_loader, epochs-1, "FINAL STATE")
 
     print("\nGenerating final topology visualizations...")
     final_figs = [
@@ -154,8 +140,7 @@ def main():
     ]
     for fig, filename in final_figs:
         fig.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.close('all')
-        
+    plt.close('all')        
     monitor.remove_hooks()
 
 if __name__ == "__main__": main()
