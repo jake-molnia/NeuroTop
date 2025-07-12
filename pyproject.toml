@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ntop"
-version = "0.1.0"
-description = "Neural topology analysis"
-authors = [{name = "Neural Topology Team"}]
+version = "0.0.0a1"
+description = "ntop"
+authors = [{name = "Jacob Molnia", email = "jrmolnia@wpi.edu"}]
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
@@ -15,12 +15,12 @@ dependencies = [
     "matplotlib>=3.5.0",
     "scikit-learn>=1.1.0",
     "ripser>=0.6.0",
+    "seaborn>=0.11.0",
 ]
 
 [project.optional-dependencies]
 extra = [
     "pot>=0.9.0",
-    "seaborn>=0.11.0",
 ]
 
 [tool.setuptools.packages.find]
