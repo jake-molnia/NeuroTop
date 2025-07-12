@@ -70,10 +70,12 @@ def analyze_state(model, test_loader, device, monitor, epoch, description):
     activations = monitor.get_activations()
     state = analysis.analyze(activations, 
                         max_samples=1500, 
-                        distance_metric='manhattan', # 'euclidean', 'cosine', 'manhattan'
+                        distance_metric='euclidean', # 'euclidean', 'cosine', 'manhattan'
                         normalize_activations='none', # 'none', 'l2', 'zscore', 'minmax'
-                        max_dim=1 # homology dimension (larger then 3 is HARD to compute)
-                        )
+                        max_dim=1, # homology dimension (larger then 3 is HARD to compute)
+                        random_seed=42,        # The answer to life, the universe, and everything
+                        filter_inactive_neurons=True,  # Clean data
+                        persistence_threshold=0.01)    # Filter noise
     print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}")
     return state
 
