@@ -68,7 +68,12 @@ def analyze_state(model, test_loader, device, monitor, epoch, description):
         data = data_batch[0].to(device)
         _ = model(data)
     activations = monitor.get_activations()
-    state = analysis.analyze(activations)
+    state = analysis.analyze(activations, 
+                        max_samples=1500, 
+                        distance_metric='manhattan', # 'euclidean', 'cosine', 'manhattan'
+                        normalize_activations='none', # 'none', 'l2', 'zscore', 'minmax'
+                        max_dim=1 # homology dimension (larger then 3 is HARD to compute)
+                        )
     print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}")
     return state
 
@@ -108,7 +113,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
-    epochs = 1
+    epochs = 20
     monitor_freq = 1 # Highest computational contirubitor
     
     print(f"\nStarting training for {epochs} epochs...")
@@ -125,10 +130,10 @@ def main():
             print(f"Epoch {epoch:2d}: Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
         
         #F FIXME: this shoud be more efficient, but it is the highest computational contributor
-        if epoch % monitor_freq == 0 or epoch == epochs - 1:
-            monitor.capture_snapshot(test_loader, epoch, max_samples=300)
-            current_topology = analyze_state(model, test_loader, device, monitor, epoch, f"  Topology")
-            topology_snapshots.append((epoch, current_topology))
+        # if epoch % monitor_freq == 0 or epoch == epochs - 1:
+        #     monitor.capture_snapshot(test_loader, epoch, max_samples=300)
+            # current_topology = analyze_state(model, test_loader, device, monitor, epoch, f"  Topology")
+            # topology_snapshots.append((epoch, current_topology))
         
         if test_acc > best_accuracy: best_accuracy = test_acc
     
@@ -136,7 +141,7 @@ def main():
     
     print("\n" + "="*50)
     final_topology = analyze_state(model, test_loader, device, monitor, epochs-1, "FINAL STATE")
-        
+
     print("\nGenerating final topology visualizations...")
     final_figs = [
         (plots.plot_distance_matrix(final_topology), f'{output_folder}/fashion_final_distance.png'),
