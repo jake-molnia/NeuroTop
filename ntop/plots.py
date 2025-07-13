@@ -180,30 +180,68 @@ def plot_rf_heatmap_by_layer(topology_states: List[Dict[str, Any]], rf_dim: str 
     for layer_idx, layer_name in enumerate(layer_names):
         # Collect RF values for this layer across epochs
         layer_rf_matrix = []
-        for state in topology_states:
+        valid_epochs = []
+        
+        for epoch_idx, state in enumerate(topology_states):
             rf_values = state.get('rf_values', {}).get(layer_name, {})
             if isinstance(rf_values, dict) and rf_dim in rf_values:
-                layer_rf_matrix.append(rf_values[rf_dim])
-            else:
-                # Fallback for old format or missing dimension
-                layer_rf_matrix.append(np.array([]))
+                rf_array = np.array(rf_values[rf_dim])
+                if rf_array.size > 0:  # Only include non-empty arrays
+                    layer_rf_matrix.append(rf_array)
+                    valid_epochs.append(epochs[epoch_idx])
         
-        # Convert to matrix (neurons x epochs)
-        if layer_rf_matrix and len(layer_rf_matrix[0]) > 0:
-            rf_matrix = np.array(layer_rf_matrix).T  # Transpose to get neurons x epochs
-            
-            # Create heatmap
-            im = axes[layer_idx].imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
-            axes[layer_idx].set_title(f'{rf_dim.upper()} Evolution - {layer_name}')
-            axes[layer_idx].set_xlabel('Epoch')
-            axes[layer_idx].set_ylabel('Neuron Index')
-            
-            # Set x-ticks to epoch numbers
-            axes[layer_idx].set_xticks(range(len(epochs)))
-            axes[layer_idx].set_xticklabels(epochs)
-            
-            # Add colorbar
-            plt.colorbar(im, ax=axes[layer_idx], label=f'{rf_dim.upper()} Value')
+        # Check if we have valid data and if all arrays have the same length
+        if layer_rf_matrix:
+            # Check if all arrays have the same length
+            lengths = [len(arr) for arr in layer_rf_matrix]
+            if len(set(lengths)) == 1:
+                # All arrays have the same length, can create matrix normally
+                rf_matrix = np.array(layer_rf_matrix).T  # Transpose to get neurons x epochs
+                
+                # Create heatmap
+                im = axes[layer_idx].imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
+                axes[layer_idx].set_title(f'{rf_dim.upper()} Evolution - {layer_name}')
+                axes[layer_idx].set_xlabel('Epoch')
+                axes[layer_idx].set_ylabel('Neuron Index')
+                
+                # Set x-ticks to valid epoch numbers
+                axes[layer_idx].set_xticks(range(len(valid_epochs)))
+                axes[layer_idx].set_xticklabels(valid_epochs)
+                
+                # Add colorbar
+                plt.colorbar(im, ax=axes[layer_idx], label=f'{rf_dim.upper()} Value')
+            else:
+                # Arrays have different lengths - pad or truncate to handle this
+                max_length = max(lengths)
+                min_length = min(lengths)
+                
+                # Option 1: Truncate to minimum length
+                truncated_matrix = []
+                for arr in layer_rf_matrix:
+                    truncated_matrix.append(arr[:min_length])
+                
+                rf_matrix = np.array(truncated_matrix).T
+                
+                # Create heatmap with warning
+                im = axes[layer_idx].imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
+                axes[layer_idx].set_title(f'{rf_dim.upper()} Evolution - {layer_name}\n(Truncated to {min_length} neurons)')
+                axes[layer_idx].set_xlabel('Epoch')
+                axes[layer_idx].set_ylabel('Neuron Index')
+                
+                # Set x-ticks to valid epoch numbers
+                axes[layer_idx].set_xticks(range(len(valid_epochs)))
+                axes[layer_idx].set_xticklabels(valid_epochs)
+                
+                # Add colorbar
+                plt.colorbar(im, ax=axes[layer_idx], label=f'{rf_dim.upper()} Value')
+                
+                print(f"Warning: Layer {layer_name} has inconsistent neuron counts across epochs.")
+                print(f"Neuron counts: min={min_length}, max={max_length}. Truncated to {min_length}.")
+        else:
+            # No valid data for this layer
+            axes[layer_idx].text(0.5, 0.5, f'No {rf_dim} data for {layer_name}', 
+                                ha='center', va='center', transform=axes[layer_idx].transAxes)
+            axes[layer_idx].set_title(f'{rf_dim.upper()} Evolution - {layer_name} (No Data)')
     
     plt.tight_layout()
     return fig
@@ -687,15 +725,32 @@ def plot_rf_heatmap_network(topology_states: List[Dict[str, Any]], rf_dim: str =
     
     for layer_name in layer_names:
         layer_rf_across_epochs = []
-        for state in topology_states:
+        valid_epochs_for_layer = []
+        
+        for epoch_idx, state in enumerate(topology_states):
             layer_rf = state.get('rf_values', {}).get(layer_name, {})
             if isinstance(layer_rf, dict) and rf_dim in layer_rf:
-                layer_rf_across_epochs.append(layer_rf[rf_dim])
-            else:
-                layer_rf_across_epochs.append(np.array([]))
+                rf_array = np.array(layer_rf[rf_dim])
+                if rf_array.size > 0:  # Only include non-empty arrays
+                    layer_rf_across_epochs.append(rf_array)
+                    valid_epochs_for_layer.append(epochs[epoch_idx])
         
-        if layer_rf_across_epochs and len(layer_rf_across_epochs[0]) > 0:
-            layer_matrix = np.array(layer_rf_across_epochs).T  # neurons x epochs
+        if layer_rf_across_epochs:
+            # Check if all arrays have the same length
+            lengths = [len(arr) for arr in layer_rf_across_epochs]
+            if len(set(lengths)) == 1:
+                # All arrays have the same length
+                layer_matrix = np.array(layer_rf_across_epochs).T  # neurons x epochs
+            else:
+                # Handle different lengths by truncating to minimum
+                min_length = min(lengths)
+                max_length = max(lengths)
+                truncated_arrays = [arr[:min_length] for arr in layer_rf_across_epochs]
+                layer_matrix = np.array(truncated_arrays).T
+                
+                print(f"Warning: Layer {layer_name} has inconsistent neuron counts across epochs.")
+                print(f"Neuron counts: min={min_length}, max={max_length}. Truncated to {min_length}.")
+            
             all_rf_matrix.append(layer_matrix)
             
             n_neurons_in_layer = layer_matrix.shape[0]
@@ -705,7 +760,16 @@ def plot_rf_heatmap_network(topology_states: List[Dict[str, Any]], rf_dim: str =
     
     # Concatenate all layers
     if all_rf_matrix:
-        full_matrix = np.vstack(all_rf_matrix)
+        # Check if all layer matrices have the same number of epochs
+        epoch_counts = [matrix.shape[1] for matrix in all_rf_matrix]
+        if len(set(epoch_counts)) == 1:
+            full_matrix = np.vstack(all_rf_matrix)
+        else:
+            # Truncate all matrices to the minimum number of epochs
+            min_epochs = min(epoch_counts)
+            truncated_matrices = [matrix[:, :min_epochs] for matrix in all_rf_matrix]
+            full_matrix = np.vstack(truncated_matrices)
+            print(f"Warning: Layers have different numbers of valid epochs. Truncated to {min_epochs} epochs.")
         
         fig, ax = plt.subplots(figsize=figsize)
         im = ax.imshow(full_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
@@ -722,9 +786,10 @@ def plot_rf_heatmap_network(topology_states: List[Dict[str, Any]], rf_dim: str =
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Neuron Index (by Layer)')
         
-        # Set x-ticks to epoch numbers
-        ax.set_xticks(range(len(epochs)))
-        ax.set_xticklabels(epochs)
+        # Set x-ticks to epoch numbers (use the epochs that are actually plotted)
+        plotted_epochs = epochs[:full_matrix.shape[1]]
+        ax.set_xticks(range(len(plotted_epochs)))
+        ax.set_xticklabels(plotted_epochs)
         
         plt.colorbar(im, ax=ax, label=f'{rf_dim.upper()} Value')
         plt.tight_layout()
@@ -734,8 +799,9 @@ def plot_rf_heatmap_network(topology_states: List[Dict[str, Any]], rf_dim: str =
         # Return empty figure if no data
         fig, ax = plt.subplots(figsize=figsize)
         ax.text(0.5, 0.5, f'No {rf_dim} data available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'Network-wide {rf_dim.upper()} Evolution (No Data)')
         return fig
-
+    
 def plot_rf_multidim_heatmap_by_layer(topology_states: List[Dict[str, Any]], figsize: Tuple[int, int] = (20, 12)) -> Figure:
     """Plot RF heatmaps for all dimensions side by side for each layer"""
     epochs = [state['epoch'] for state in topology_states]
@@ -774,30 +840,61 @@ def plot_rf_multidim_heatmap_by_layer(topology_states: List[Dict[str, Any]], fig
             
             # Collect RF values for this layer and dimension across epochs
             layer_rf_matrix = []
-            for state in topology_states:
+            valid_epochs = []
+            
+            for epoch_idx, state in enumerate(topology_states):
                 layer_rf = state.get('rf_values', {}).get(layer_name, {})
                 if isinstance(layer_rf, dict) and rf_dim in layer_rf:
-                    layer_rf_matrix.append(layer_rf[rf_dim])
-                else:
-                    layer_rf_matrix.append(np.array([]))
+                    rf_array = np.array(layer_rf[rf_dim])
+                    if rf_array.size > 0:  # Only include non-empty arrays
+                        layer_rf_matrix.append(rf_array)
+                        valid_epochs.append(epochs[epoch_idx])
             
             # Convert to matrix (neurons x epochs)
-            if layer_rf_matrix and len(layer_rf_matrix[0]) > 0:
-                rf_matrix = np.array(layer_rf_matrix).T  # Transpose to get neurons x epochs
-                
-                # Create heatmap
-                im = ax.imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
-                ax.set_title(f'{rf_dim.upper()} - {layer_name}')
-                ax.set_xlabel('Epoch')
-                if dim_idx == 0:  # Only leftmost column gets y-label
-                    ax.set_ylabel('Neuron Index')
-                
-                # Set x-ticks to epoch numbers
-                ax.set_xticks(range(len(epochs)))
-                ax.set_xticklabels(epochs)
-                
-                # Add colorbar
-                plt.colorbar(im, ax=ax, label=f'{rf_dim.upper()} Value', shrink=0.8)
+            if layer_rf_matrix:
+                # Check if all arrays have the same length
+                lengths = [len(arr) for arr in layer_rf_matrix]
+                if len(set(lengths)) == 1:
+                    # All arrays have the same length
+                    rf_matrix = np.array(layer_rf_matrix).T  # Transpose to get neurons x epochs
+                    
+                    # Create heatmap
+                    im = ax.imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
+                    ax.set_title(f'{rf_dim.upper()} - {layer_name}')
+                    ax.set_xlabel('Epoch')
+                    if dim_idx == 0:  # Only leftmost column gets y-label
+                        ax.set_ylabel('Neuron Index')
+                    
+                    # Set x-ticks to valid epoch numbers
+                    ax.set_xticks(range(len(valid_epochs)))
+                    ax.set_xticklabels(valid_epochs)
+                    
+                    # Add colorbar
+                    plt.colorbar(im, ax=ax, label=f'{rf_dim.upper()} Value', shrink=0.8)
+                else:
+                    # Handle different lengths by truncating to minimum
+                    min_length = min(lengths)
+                    max_length = max(lengths)
+                    truncated_arrays = [arr[:min_length] for arr in layer_rf_matrix]
+                    rf_matrix = np.array(truncated_arrays).T
+                    
+                    # Create heatmap with warning in title
+                    im = ax.imshow(rf_matrix, cmap='viridis', aspect='auto', interpolation='nearest')
+                    ax.set_title(f'{rf_dim.upper()} - {layer_name}\n(Truncated to {min_length})')
+                    ax.set_xlabel('Epoch')
+                    if dim_idx == 0:  # Only leftmost column gets y-label
+                        ax.set_ylabel('Neuron Index')
+                    
+                    # Set x-ticks to valid epoch numbers
+                    ax.set_xticks(range(len(valid_epochs)))
+                    ax.set_xticklabels(valid_epochs)
+                    
+                    # Add colorbar
+                    plt.colorbar(im, ax=ax, label=f'{rf_dim.upper()} Value', shrink=0.8)
+                    
+                    if layer_idx == 0 and dim_idx == 0:  # Only print warning once
+                        print(f"Warning: Layer {layer_name} has inconsistent neuron counts across epochs.")
+                        print(f"Neuron counts: min={min_length}, max={max_length}. Truncated to {min_length}.")
             else:
                 ax.text(0.5, 0.5, f'No {rf_dim} data', ha='center', va='center', transform=ax.transAxes)
                 ax.set_title(f'{rf_dim.upper()} - {layer_name}')
