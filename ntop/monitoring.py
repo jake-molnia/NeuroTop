@@ -57,19 +57,6 @@ class ActivationMonitor:
             self.topology_states.append(topology_data)
             self._save_analysis()
         return state
-    
-    def _format_rf_output(self, state: Dict[str, Any]) -> str:
-        """Format rf information for console output"""
-        if 'rf_values' not in state: return ""
-        rf_values = state['rf_values']
-        # Compute overall median rf across all layers
-        all_rf_values = []
-        for layer_rf in rf_values.values():
-            all_rf_values.extend(layer_rf)
-        if all_rf_values:
-            overall_median = np.median(all_rf_values)
-            return f", rf_median: {overall_median:.4f}"
-        return ""
         
     def _save_analysis(self):
         assert self.topology_states, "No topology states to save"
@@ -83,6 +70,31 @@ class ActivationMonitor:
     
     def load_analysis(self, filepath: str) -> Dict[str, Any]: return dict(np.load(filepath, allow_pickle=True))
     
+    def _format_rf_output(self, state: Dict[str, Any]) -> str:
+        """Format rf information for console output"""
+        assert 'rf_values' in state, "State must contain 'rf_values' key"
+        rf_values = state['rf_values']
+        rf_dims = set()
+        for layer_rf in rf_values.values():
+            if isinstance(layer_rf, dict):
+                rf_dims.update(layer_rf.keys())
+        assert rf_dims, "No RF dimensions found in rf_values"
+        
+        # Compute overall median RF for each dimension
+        rf_summary = {}
+        for dim in sorted(rf_dims):
+            all_rf_values = []
+            for layer_rf in rf_values.values():
+                if isinstance(layer_rf, dict) and dim in layer_rf:
+                    all_rf_values.extend(layer_rf[dim])
+            if all_rf_values:
+                rf_summary[dim] = np.median(all_rf_values)
+        
+        if rf_summary:
+            rf_str = ", ".join([f"{dim}_median: {val:.4f}" for dim, val in rf_summary.items()])
+            return f", {rf_str}"
+        return ""
+
     def get_rf_evolution(self) -> Dict[str, Any]:
         """Get evolution of rf values over epochs"""
         assert self.topology_states, "No topology states available. Run analysis with save=True first."
@@ -91,32 +103,46 @@ class ActivationMonitor:
         
         if not self.topology_states: return rf_evolution
         
-        # Get layer names from first state
+        # Get layer names and RF dimensions from first state
         first_rf_values = self.topology_states[0].get('rf_values', {})
         layer_names = list(first_rf_values.keys())
         
-        # Collect rf statistics over time
+        # Find all RF dimensions
+        rf_dims = set()
+        for layer_rf in first_rf_values.values():
+            if isinstance(layer_rf, dict):
+                rf_dims.update(layer_rf.keys())
+        
+        # Collect RF statistics over time for each dimension
         rf_stats_evolution = {}
         for layer in layer_names:
-            rf_stats_evolution[layer] = {
-                'mean': [],
-                'median': [],
-                'std': []
-            }
-            for state in self.topology_states:
-                layer_rf = state.get('rf_values', {}).get(layer, np.array([]))
-                if len(layer_rf) > 0:
-                    rf_stats_evolution[layer]['mean'].append(np.mean(layer_rf))
-                    rf_stats_evolution[layer]['median'].append(np.median(layer_rf))
-                    rf_stats_evolution[layer]['std'].append(np.std(layer_rf))
-                else:
-                    rf_stats_evolution[layer]['mean'].append(0.0)
-                    rf_stats_evolution[layer]['median'].append(0.0)
-                    rf_stats_evolution[layer]['std'].append(0.0)
+            rf_stats_evolution[layer] = {}
+            for dim in sorted(rf_dims):
+                rf_stats_evolution[layer][dim] = {
+                    'mean': [],
+                    'median': [],
+                    'std': []
+                }
+                for state in self.topology_states:
+                    layer_rf = state.get('rf_values', {}).get(layer, {})
+                    if isinstance(layer_rf, dict) and dim in layer_rf:
+                        dim_rf = layer_rf[dim]
+                        if len(dim_rf) > 0:
+                            rf_stats_evolution[layer][dim]['mean'].append(np.mean(dim_rf))
+                            rf_stats_evolution[layer][dim]['median'].append(np.median(dim_rf))
+                            rf_stats_evolution[layer][dim]['std'].append(np.std(dim_rf))
+                        else:
+                            rf_stats_evolution[layer][dim]['mean'].append(0.0)
+                            rf_stats_evolution[layer][dim]['median'].append(0.0)
+                            rf_stats_evolution[layer][dim]['std'].append(0.0)
+                    else:
+                        rf_stats_evolution[layer][dim]['mean'].append(0.0)
+                        rf_stats_evolution[layer][dim]['median'].append(0.0)
+                        rf_stats_evolution[layer][dim]['std'].append(0.0)
         
         rf_evolution['rf_stats_evolution'] = rf_stats_evolution
         return rf_evolution
-
+    
     def _prepare_save_data(self, state: Dict[str, Any], epoch: int) -> Dict[str, Any]:
         """Prepare topology data for saving"""
         topology_data = {

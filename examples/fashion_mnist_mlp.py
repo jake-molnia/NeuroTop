@@ -86,7 +86,7 @@ def main():
         max_dim=1,
         random_seed=42,
         filter_inactive_neurons=True,
-        persistence_threshold=0.01
+        persistence_threshold=0.01,
     )
     
     print("\n" + "="*50)
@@ -117,11 +117,8 @@ def main():
     for epoch in range(epochs):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         test_acc = evaluate(model, test_loader, device)
-        scheduler.step()
-        
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch:2d}: Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
-
+        scheduler.step()        
+        print(f"Epoch {epoch:2d}: Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, Test Acc={test_acc:.2f}%")
         monitor.analyze(test_loader, epoch, save=True)
         if test_acc > best_accuracy: best_accuracy = test_acc
     
@@ -140,7 +137,55 @@ def main():
     ]
     for fig, filename in final_figs:
         fig.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.close('all')        
+    plt.close('all')
+    topology_states = monitor.topology_states
+    if topology_states:
+        rf_figs = [
+            # Individual dimension heatmaps
+            (plots.plot_rf_heatmap_by_layer(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_heatmap_by_layer.png'),
+            # (plots.plot_rf_heatmap_by_layer(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_heatmap_by_layer.png'),
+            (plots.plot_rf_heatmap_network(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_heatmap_network.png'),
+            # (plots.plot_rf_heatmap_network(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_heatmap_network.png'),
+            
+            # Multi-dimensional comparison plots
+            (plots.plot_rf_multidim_heatmap_by_layer(topology_states), f'{output_folder}/fashion_rf_multidim_heatmap.png'),
+            (plots.plot_rf_box_evolution_multidim(topology_states), f'{output_folder}/fashion_rf_multidim_evolution.png'),
+            
+            # Original per-layer distribution plots (will work with rf_0 by default)
+            (plots.plot_rf_distribution_evolution(topology_states), f'{output_folder}/fashion_rf_distribution_evolution.png'),
+            (plots.plot_rf_violin_evolution(topology_states), f'{output_folder}/fashion_rf_violin_evolution.png'),
+            (plots.plot_rf_box_evolution(topology_states), f'{output_folder}/fashion_rf_box_evolution.png'),
+            
+            # Network-wide distribution plots (combining all layers)
+            (plots.plot_rf_distribution_evolution_network(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_distribution_evolution_network.png'),
+            (plots.plot_rf_violin_evolution_network(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_violin_evolution_network.png'),
+            (plots.plot_rf_box_evolution_network(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_box_evolution_network.png'),
+            
+            # Comprehensive comparison plot
+            (plots.plot_rf_evolution_comparison(topology_states, 'rf_0'), f'{output_folder}/fashion_rf0_evolution_comparison.png'),
+            
+            # Additional network-wide plots for rf_1 (uncomment if rf_1 is available)
+            # (plots.plot_rf_distribution_evolution_network(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_distribution_evolution_network.png'),
+            # (plots.plot_rf_violin_evolution_network(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_violin_evolution_network.png'),
+            # (plots.plot_rf_box_evolution_network(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_box_evolution_network.png'),
+            # (plots.plot_rf_evolution_comparison(topology_states, 'rf_1'), f'{output_folder}/fashion_rf1_evolution_comparison.png'),
+        ]
+        for fig, filename in rf_figs:
+            if fig:  # Check if figure was created successfully
+                fig.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.close('all')
+        print("Multi-dimensional RF plots saved")
+        if topology_states:
+            first_rf = topology_states[0].get('rf_values', {})
+            if first_rf:
+                for layer_name, layer_rf in first_rf.items():
+                    if isinstance(layer_rf, dict):
+                        dims = sorted(layer_rf.keys())
+                        print(f"Layer {layer_name}: RF dimensions {dims}")
+    else:
+        print("No topology states available for RF evolution plots")
+    
     monitor.remove_hooks()
+
 
 if __name__ == "__main__": main()
