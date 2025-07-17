@@ -180,6 +180,64 @@ def _deduplicate_quantized_neurons(quantized_matrix: torch.Tensor, neuron_info: 
         'compression_ratio': n_neurons / len(cluster_representatives)
     }
 
+def _detect_layers(activations: Dict[str, torch.Tensor]) -> Dict[int, Dict[str, torch.Tensor]]:
+    layers = {}
+    unrecognized = []
+    
+    for layer_name, layer_acts in activations.items():
+        layer_num = None
+        if 'encoder.layer.' in layer_name: # BERT patterns: bert.encoder.layer.N.* 
+            try:
+                parts = layer_name.split('encoder.layer.')[1].split('.') # Extract number after 'encoder.layer.'
+                layer_num = int(parts[0])
+            except (IndexError, ValueError):
+                unrecognized.append(layer_name)
+                continue
+        elif 'layers.' in layer_name: # MLP patterns: layers.N.*
+            try:
+                parts = layer_name.split('layers.')[1].split('.')
+                layer_num = int(parts[0])
+            except (IndexError, ValueError):
+                unrecognized.append(layer_name)
+                continue
+        elif 'pooler' in layer_name or 'embeddings' in layer_name: # Skip pooler and other non-layer components
+            print(f"DEBUG: Skipping non-layer component: {layer_name}")
+            continue
+        else:
+            unrecognized.append(layer_name)
+            continue
+        
+        if layer_num not in layers:
+            layers[layer_num] = {}
+        layers[layer_num][layer_name] = layer_acts
+    
+    if unrecognized: raise ValueError(f"Unrecognized layer names: {unrecognized}")
+    
+    print(f"DEBUG: Successfully grouped into {len(layers)} layers")
+    return layers
+
+def _detect_components(activations: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
+    components = {'attention': {}, 'feedforward': {}, 'embeddings': {}, 'pooler': {}}
+    unrecognized = []
+    for layer_name, layer_acts in activations.items():
+        name_lower = layer_name.lower()
+        if any(x in name_lower for x in ['attention.self.query', 'attention.self.key', 'attention.self.value', 'attention.output']):
+            components['attention'][layer_name] = layer_acts
+        elif any(x in name_lower for x in ['intermediate.dense', 'output.dense']) and 'attention' not in name_lower:
+            components['feedforward'][layer_name] = layer_acts
+        elif 'embeddings' in name_lower:
+            components['embeddings'][layer_name] = layer_acts
+        elif 'pooler' in name_lower:
+            components['pooler'][layer_name] = layer_acts            
+        else:
+            unrecognized.append(layer_name)
+    if unrecognized:
+        raise ValueError(f"Unrecognized component names: {unrecognized}")    
+    components = {k: v for k, v in components.items() if v}
+    for comp_name, comp_layers in components.items():
+        print(f"DEBUG: {comp_name}: {len(comp_layers)} layers")
+    return components
+
 def analyze(activations: Dict[str, torch.Tensor], 
            distance_metric: str = 'euclidean', 
            max_dim: int = 2,
@@ -190,8 +248,42 @@ def analyze(activations: Dict[str, torch.Tensor],
            filter_inactive_neurons: bool = False,
            use_quantization: bool = False,
            quantization_resolution: float = 0.1,
+           analyze_by_layers: bool = False,
+           analyze_by_components: bool = False,
+           analyze_full_network: bool = True,
            ) -> Dict[str, Any]:
-    assert activations, "Activations dictionary cannot be empty"    
+    assert activations, "Activations dictionary cannot be empty"
+    results = {}
+    if analyze_full_network:
+        print(f"Analyzing full network ({sum(acts.numel() for acts in activations.values())} total activations)...")
+        results['full_network'] = _analyze_single(activations, distance_metric, max_dim, max_samples,
+                                                 normalize_activations, persistence_threshold, random_seed,
+                                                 filter_inactive_neurons, use_quantization, quantization_resolution)    
+    if analyze_by_layers:
+        print("Analyzing by layers...")
+        layers = _detect_layers(activations)
+        results['by_layers'] = {}
+        for layer_num, layer_activations in layers.items():
+            print(f"  Layer {layer_num}: {sum(acts.numel() for acts in layer_activations.values())} activations")
+            results['by_layers'][layer_num] = _analyze_single(layer_activations, distance_metric, max_dim, max_samples,
+                                                            normalize_activations, persistence_threshold, random_seed,
+                                                            filter_inactive_neurons, use_quantization, quantization_resolution)    
+    if analyze_by_components:
+        print("Analyzing by components...")
+        components = _detect_components(activations)
+        results['by_components'] = {}
+        for component_name, component_activations in components.items():
+            print(f"  {component_name}: {sum(acts.numel() for acts in component_activations.values())} activations")
+            results['by_components'][component_name] = _analyze_single(component_activations, distance_metric, max_dim, max_samples,
+                                                                     normalize_activations, persistence_threshold, random_seed,
+                                                                     filter_inactive_neurons, use_quantization, quantization_resolution)
+    
+    return results
+
+def _analyze_single(activations: Dict[str, torch.Tensor], 
+                   distance_metric: str, max_dim: int, max_samples: Optional[int],
+                   normalize_activations: str, persistence_threshold: float, random_seed: Optional[int],
+                   filter_inactive_neurons: bool, use_quantization: bool, quantization_resolution: float) -> Dict[str, Any]:
     if filter_inactive_neurons: activations = _filter_inactive_neurons(activations)
     activations = _normalize_activations(activations, normalize_activations)    
     unified = _unify_neuron_space(activations, max_samples, random_seed, 
@@ -201,26 +293,19 @@ def analyze(activations: Dict[str, torch.Tensor],
     
     if use_quantization and unified['quantization_info'] is not None:
         quantization_info = unified['quantization_info']
-        
-        # Work exclusively with quantized neuron space
-        # The unified['neuron_matrix'] already contains only representative neurons
-        # and unified['neuron_info'] contains their layer information
         representative_activations = {}
         current_idx = 0
         
         for layer_name in activations.keys():
-            # Find how many representative neurons belong to this layer
             layer_neuron_count = sum(1 for info in unified['neuron_info'] if info['layer'] == layer_name)
             if layer_neuron_count > 0:
-                # Extract representative neurons for this layer
                 layer_matrix = unified['neuron_matrix'][current_idx:current_idx + layer_neuron_count]
-                representative_activations[layer_name] = layer_matrix.T  # Convert to [n_samples, n_neurons]
+                representative_activations[layer_name] = layer_matrix.T
                 current_idx += layer_neuron_count
         
-        # Compute RF only on representative neurons
         rf_values = _compute_per_neuron_rf(representative_activations, distance_metric, max_dim)
-        expanded_neuron_info = unified['neuron_info']  # Already contains only representatives
-        total_neurons = len(unified['neuron_info'])  # Use compressed count
+        expanded_neuron_info = unified['neuron_info']
+        total_neurons = len(unified['neuron_info'])
     else:
         rf_values = _compute_per_neuron_rf(activations, distance_metric, max_dim)
         expanded_neuron_info = unified['neuron_info']

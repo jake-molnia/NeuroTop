@@ -16,7 +16,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.ba
 def setup_data(subset_size=150):
     """Load and prepare CoLA dataset from GLUE (following paper approach)"""
     dataset = load_dataset('glue', 'cola', split='validation')
-    # Convert to list to handle indexing properly
     texts = []
     for i, item in enumerate(dataset):
         if i >= subset_size:
@@ -37,7 +36,7 @@ model, tokenizer = setup_model()
 texts = setup_data()
 total_params = sum(p.numel() for p in model.parameters())
 
-print(f"BERT Topological Analysis")
+print(f"BERT Hierarchical Analysis")
 print(f"Device: {device}")
 print(f"Model parameters: {total_params:,}")
 print(f"Data: {len(texts)} text samples")
@@ -46,7 +45,7 @@ print(f"Data: {len(texts)} text samples")
 encoded = tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
 
 #%% Configure Analysis
-output_folder = './outputs/bert_topology_analysis'
+output_folder = './outputs/bert_hierarchical_analysis'
 os.makedirs(output_folder, exist_ok=True)
 
 monitor = ActivationMonitor(model, model_type='transformer')
@@ -60,188 +59,311 @@ monitor.set_config(
     filter_inactive_neurons=True,
     persistence_threshold=0.01,
     use_quantization=True,
-    quantization_resolution=1000000000,
+    quantization_resolution=0.1,
     sequence_strategy='cls',
-    rf_distribution_strategy='uniform'
+    analyze_full_network=False,
+    analyze_by_layers=False,        
+    analyze_by_components=True,    
 )
 
 #%% Run BERT Analysis
 print("\nAnalyzing BERT network topology...")
 with torch.no_grad():
-    # Move inputs to device
     input_ids = encoded['input_ids'].to(device)
     attention_mask = encoded['attention_mask'].to(device)
     
-    # Run model and capture activations
     outputs = model(input_ids, attention_mask=attention_mask)
     
-    # Get activations and analyze
     activations = monitor.get_activations()
     result = analysis.analyze(
         activations, 
         max_dim=2, 
         distance_metric='euclidean',
         use_quantization=True, 
-        quantization_resolution=0.1
+        quantization_resolution=5,
+        analyze_by_layers=False,
+        analyze_by_components=True, 
+        analyze_full_network=False
     )
-#%% Extract RF Values by Component (Paper's Key Finding)
-rf_data = result['rf_values']
-component_stats = {}
 
-for layer_name, layer_rf in rf_data.items():
-    if 'intermediate' in layer_name.lower():
-        component_type = 'Intermediate'
-    elif 'attention.output' in layer_name.lower():
-        component_type = 'Attention_Output'
-    elif 'output' in layer_name.lower():
-        component_type = 'Output'
-    elif 'query' in layer_name.lower() or '.q.' in layer_name:
-        component_type = 'Query'
-    elif 'key' in layer_name.lower() or '.k.' in layer_name:
-        component_type = 'Key'
-    elif 'value' in layer_name.lower() or '.v.' in layer_name:
-        component_type = 'Value'
-    else:
-        component_type = 'Other'
+#%% Extract Component Results
+component_results = result['by_components']
+
+print(f"\nComponent Analysis Results:")
+for comp_name, comp_result in component_results.items():
+    rf_data = comp_result['rf_values']
+    all_rf_values = []
+    for layer_rf in rf_data.values():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        all_rf_values.extend(rf_0_values[rf_0_values > 0])
     
-    if component_type not in component_stats:
-        component_stats[component_type] = []
+    print(f"{comp_name}: {comp_result['total_neurons']} neurons, Betti: {comp_result['betti_numbers']}, RF median: {np.median(all_rf_values):.4f}")
+
+#%% Individual Component Plots
+print("Generating individual component plots...")
+
+for comp_name, comp_result in component_results.items():
+    plots.plot_persistence_diagram(comp_result)
+    plt.title(f'Persistence Diagram - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/persistence_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
+
+for comp_name, comp_result in component_results.items():
+    plots.plot_tsne_2d(comp_result)
+    plt.title(f't-SNE - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/tsne_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
+
+for comp_name, comp_result in component_results.items():
+    plots.plot_distance_matrix(comp_result)
+    plt.title(f'Distance Matrix - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/distance_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
+
+for comp_name, comp_result in component_results.items():
+    plots.plot_betti_numbers(comp_result)
+    plt.title(f'Betti Numbers - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/betti_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
+
+#%% Cross-Component Comparisons
+print("Generating cross-component comparisons...")
+
+# RF Distribution Comparison
+fig, ax = plt.subplots(figsize=(12, 8))
+colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+for i, (comp_name, comp_result) in enumerate(component_results.items()):
+    rf_data = comp_result['rf_values']
+    all_rf_values = []
+    for layer_rf in rf_data.values():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        all_rf_values.extend(rf_0_values[rf_0_values > 0])
     
-    rf_0_values = np.array(layer_rf['rf_0'])
-    component_stats[component_type].extend(rf_0_values[rf_0_values > 0])
+    if all_rf_values:
+        ax.hist(all_rf_values, bins=30, alpha=0.6, 
+               label=f'{comp_name.title()} (med: {np.median(all_rf_values):.3f})',
+               color=colors[i % len(colors)])
 
-#%% Results Summary (Following Paper's Analysis)
-fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-# Component RF distributions
-ax = axes[0,0]
-for comp_type, values in component_stats.items():
-    if len(values) > 0:
-        ax.hist(values, bins=30, alpha=0.6, label=f'{comp_type} (med: {np.median(values):.3f})')
 ax.set_xlabel('RF Value')
 ax.set_ylabel('Count')
-ax.set_title('RF Distribution by Component Type')
+ax.set_title('RF Distribution Comparison')
 ax.legend()
+ax.grid(True, alpha=0.3)
+plt.savefig(f'{output_folder}/rf_comparison.png', dpi=150, bbox_inches='tight')
+# plt.show()
 
-# Component importance (Key insight)
-ax = axes[0,1]
-comp_names = list(component_stats.keys())
-medians = [np.median(component_stats[comp]) if len(component_stats[comp]) > 0 else 0 
-           for comp in comp_names]
-bars = ax.bar(comp_names, medians)
+# Betti Number Comparison
+fig, ax = plt.subplots(figsize=(12, 6))
+comp_names = list(component_results.keys())
+betti_0 = [component_results[comp]['betti_numbers'][0] for comp in comp_names]
+betti_1 = [component_results[comp]['betti_numbers'][1] for comp in comp_names]
+betti_2 = [component_results[comp]['betti_numbers'][2] for comp in comp_names]
+
+x = np.arange(len(comp_names))
+width = 0.25
+
+ax.bar(x - width, betti_0, width, label='β₀', alpha=0.8)
+ax.bar(x, betti_1, width, label='β₁', alpha=0.8)
+ax.bar(x + width, betti_2, width, label='β₂', alpha=0.8)
+
+ax.set_xlabel('Component')
+ax.set_ylabel('Betti Number')
+ax.set_title('Betti Numbers by Component')
+ax.set_xticks(x)
+ax.set_xticklabels([comp.title() for comp in comp_names])
+ax.legend()
+ax.grid(True, alpha=0.3, axis='y')
+plt.savefig(f'{output_folder}/betti_comparison.png', dpi=150, bbox_inches='tight')
+# plt.show()
+
+# Component Size Comparison
+fig, ax = plt.subplots(figsize=(10, 6))
+neuron_counts = [component_results[comp]['total_neurons'] for comp in comp_names]
+bars = ax.bar(comp_names, neuron_counts, alpha=0.8)
+
+ax.set_xlabel('Component')
+ax.set_ylabel('Number of Neurons')
+ax.set_title('Neuron Count by Component')
+ax.grid(True, alpha=0.3, axis='y')
+
+for bar, count in zip(bars, neuron_counts):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(neuron_counts)*0.01,
+            f'{count:,}', ha='center', va='bottom')
+
+plt.xticks(rotation=45)
+plt.savefig(f'{output_folder}/size_comparison.png', dpi=150, bbox_inches='tight')
+# plt.show()
+
+# RF Median Comparison
+fig, ax = plt.subplots(figsize=(10, 6))
+medians = []
+for comp_name in comp_names:
+    rf_data = component_results[comp_name]['rf_values']
+    all_rf_values = []
+    for layer_rf in rf_data.values():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        all_rf_values.extend(rf_0_values[rf_0_values > 0])
+    medians.append(np.median(all_rf_values) if all_rf_values else 0.0)
+
+bars = ax.bar(comp_names, medians, alpha=0.8)
+ax.set_xlabel('Component')
 ax.set_ylabel('Median RF Value')
-ax.set_title('Component Importance (Higher = More Important)')
-ax.tick_params(axis='x', rotation=45)
+ax.set_title('Component Importance (Median RF)')
+ax.grid(True, alpha=0.3, axis='y')
 
-# Add values on bars
-for bar, val in zip(bars, medians):
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001, 
-            f'{val:.3f}', ha='center', va='bottom')
+for bar, median in zip(bars, medians):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(medians)*0.01,
+            f'{median:.3f}', ha='center', va='bottom')
 
-# Persistence diagram
-ax = axes[1,0]
-diagrams = result['persistence']['dgms']
-colors = ['red', 'blue', 'green']
-for dim, diagram in enumerate(diagrams):
-    if len(diagram) > 0:
-        finite_mask = ~np.isinf(diagram[:, 1])
-        finite_points = diagram[finite_mask]
-        if len(finite_points) > 0:
-            ax.scatter(finite_points[:, 0], finite_points[:, 1], 
-                      c=colors[dim], alpha=0.7, s=20, label=f'H{dim}')
-ax.set_xlabel('Birth')
-ax.set_ylabel('Death')
-ax.set_title('Persistence Diagram')
-ax.legend()
+plt.xticks(rotation=45)
+plt.savefig(f'{output_folder}/rf_medians.png', dpi=150, bbox_inches='tight')
+# plt.show()
 
-# RF by layer depth (BERT-specific)
-ax = axes[1,1]
-layer_depths = []
-layer_medians = []
-for layer_name, layer_rf in rf_data.items():
-    # Extract layer number for BERT
-    if 'encoder.layer.' in layer_name:
-        try:
-            layer_num = int(layer_name.split('encoder.layer.')[1].split('.')[0])
-            rf_vals = np.array(layer_rf['rf_0'])
-            if len(rf_vals) > 0:
-                layer_depths.append(layer_num)
-                layer_medians.append(np.median(rf_vals[rf_vals > 0]))
-        except:
-            pass
+#%% Attention Sub-Components
+if 'attention' in component_results:
+    print("Analyzing attention sub-components...")
+    attention_rf = component_results['attention']['rf_values']
+    
+    sub_components = {'query': [], 'key': [], 'value': [], 'attention_output': []}
+    
+    for layer_name, layer_rf in attention_rf.items():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        valid_rf = rf_0_values[rf_0_values > 0]
+        
+        if 'query' in layer_name.lower():
+            sub_components['query'].extend(valid_rf)
+        elif 'key' in layer_name.lower():
+            sub_components['key'].extend(valid_rf)
+        elif 'value' in layer_name.lower():
+            sub_components['value'].extend(valid_rf)
+        elif 'attention.output' in layer_name.lower():
+            sub_components['attention_output'].extend(valid_rf)
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    colors = ['red', 'blue', 'green', 'orange']
+    
+    for i, (sub_comp, rf_values) in enumerate(sub_components.items()):
+        if rf_values:
+            ax.hist(rf_values, bins=30, alpha=0.6,
+                   label=f'{sub_comp.title()} (med: {np.median(rf_values):.3f})',
+                   color=colors[i])
+    
+    ax.set_xlabel('RF Value')
+    ax.set_ylabel('Count')
+    ax.set_title('Attention Sub-Component RF Distributions')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.savefig(f'{output_folder}/attention_subcomponents.png', dpi=150, bbox_inches='tight')
+    # plt.show()
 
-if layer_depths:
-    ax.scatter(layer_depths, layer_medians)
-    ax.set_xlabel('Layer Depth')
-    ax.set_ylabel('Median RF')
-    ax.set_title('RF vs Layer Depth')
+#%% Feedforward Sub-Components
+if 'feedforward' in component_results:
+    print("Analyzing feedforward sub-components...")
+    ff_rf = component_results['feedforward']['rf_values']
+    
+    sub_components = {'intermediate': [], 'output': []}
+    
+    for layer_name, layer_rf in ff_rf.items():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        valid_rf = rf_0_values[rf_0_values > 0]
+        
+        if 'intermediate' in layer_name.lower():
+            sub_components['intermediate'].extend(valid_rf)
+        elif 'output' in layer_name.lower() and 'attention' not in layer_name.lower():
+            sub_components['output'].extend(valid_rf)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = ['green', 'orange']
+    
+    for i, (sub_comp, rf_values) in enumerate(sub_components.items()):
+        if rf_values:
+            ax.hist(rf_values, bins=30, alpha=0.6,
+                   label=f'{sub_comp.title()} (med: {np.median(rf_values):.3f})',
+                   color=colors[i])
+    
+    ax.set_xlabel('RF Value')
+    ax.set_ylabel('Count')
+    ax.set_title('Feedforward Sub-Component RF Distributions')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.savefig(f'{output_folder}/feedforward_subcomponents.png', dpi=150, bbox_inches='tight')
+    # plt.show()
 
-plt.tight_layout()
-plt.savefig(f'{output_folder}/bert_analysis_summary.png', dpi=150, bbox_inches='tight')
-plt.show()
+#%% RF Heatmap Analysis
+print("Generating RF heatmap visualizations...")
 
-#%% Neuron Importance Analysis
-all_rf_values = []
-neuron_info = []
+# Create fake topology_states for each component to use existing plot functions
+for comp_name, comp_result in component_results.items():
+    print(f"RF heatmap for {comp_name}...")
+    
+    # Create single-state topology data for heatmap functions
+    fake_topology_states = [{
+        'epoch': 0,
+        'rf_values': comp_result['rf_values']
+    }]
+    
+    # RF distribution evolution (static for single snapshot)
+    plots.plot_rf_distribution_evolution(fake_topology_states, 'rf_0')
+    plt.suptitle(f'RF Distribution - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/rf_distribution_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
+    
+    # RF box evolution (static for single snapshot)  
+    plots.plot_rf_box_evolution(fake_topology_states, 'rf_0')
+    plt.suptitle(f'RF Statistics - {comp_name.title()}')
+    plt.savefig(f'{output_folder}/rf_box_{comp_name}.png', dpi=150, bbox_inches='tight')
+    # plt.show()
 
-for layer_name, layer_rf in rf_data.items():
-    rf_vals = np.array(layer_rf['rf_0'])
-    for i, val in enumerate(rf_vals):
-        all_rf_values.append(val)
-        neuron_info.append((layer_name, i, val))
+# Network-wide RF comparison across components
+print("Generating network-wide RF analysis...")
 
-all_rf_values = np.array(all_rf_values)
-p30 = np.percentile(all_rf_values[all_rf_values > 0], 30)
-p50 = np.percentile(all_rf_values[all_rf_values > 0], 50)
-p70 = np.percentile(all_rf_values[all_rf_values > 0], 70)
+# Combine all component RF data for network view
+all_components_rf = {}
+for comp_name, comp_result in component_results.items():
+    for layer_name, layer_rf in comp_result['rf_values'].items():
+        # Add component prefix to layer names to distinguish
+        prefixed_name = f"{comp_name}_{layer_name}"
+        all_components_rf[prefixed_name] = layer_rf
 
-prunable_30 = sum(1 for val in all_rf_values if val <= p30)
-prunable_50 = sum(1 for val in all_rf_values if val <= p50)
-prunable_70 = sum(1 for val in all_rf_values if val <= p70)
+# Create network-wide fake topology state
+network_topology_state = [{
+    'epoch': 0, 
+    'rf_values': all_components_rf
+}]
 
-total_neurons = len(all_rf_values)
+plots.plot_rf_distribution_evolution_network(network_topology_state, 'rf_0')
+plt.title('Network-wide RF Distribution (All Components)')
+plt.savefig(f'{output_folder}/rf_network_distribution.png', dpi=150, bbox_inches='tight')
+# plt.show()
 
-print(f"BERT Compression Analysis")
+plots.plot_rf_box_evolution_network(network_topology_state, 'rf_0')
+plt.title('Network-wide RF Statistics (All Components)')
+plt.savefig(f'{output_folder}/rf_network_box.png', dpi=150, bbox_inches='tight')
+# plt.show()
+
+#%% Compression Analysis
+print(f"\nBERT Compression Analysis")
 print(f"="*50)
-print(f"Total neurons: {total_neurons}")
-print(f"Prunable at 30th percentile: {prunable_30} ({prunable_30/total_neurons*100:.1f}%)")
-print(f"Prunable at 50th percentile: {prunable_50} ({prunable_50/total_neurons*100:.1f}%)")
-print(f"Prunable at 70th percentile: {prunable_70} ({prunable_70/total_neurons*100:.1f}%)")
-print(f"RF thresholds - 30th: {p30:.4f}, 50th: {p50:.4f}, 70th: {p70:.4f}")
 
-# Component-wise importance ranking
-print(f"\nComponent Importance Ranking (Median RF):")
-comp_medians = [(comp, np.median(vals)) for comp, vals in component_stats.items() if len(vals) > 0]
-comp_medians.sort(key=lambda x: x[1], reverse=True)
-for comp, median in comp_medians:
-    print(f"{comp}: {median:.4f}")
+total_neurons = sum(comp_result['total_neurons'] for comp_result in component_results.values())
+print(f"Total neurons analyzed: {total_neurons:,}")
 
-#%% Network Topology Summary
-betti = result['betti_numbers']
-print(f"\nBERT Topological Features:")
-print(f"Connected components (β₀): {betti[0]}")
-print(f"Loops (β₁): {betti[1]}")
-print(f"Voids (β₂): {betti[2]}")
-print(f"Total neurons analyzed: {result['total_neurons']}")
-
-#%% Display Topology Visualizations
-print(f"\nDisplaying topology visualizations...")
-
-# Core topology plots
-plots.plot_distance_matrix(result)
-plt.show()
-
-plots.plot_persistence_diagram(result)
-plt.show()
-
-plots.plot_tsne_2d(result)
-plt.show()
-
-plots.plot_betti_numbers(result)
-plt.show()
-
-plots.plot_layer_composition(result)
-plt.show()
+for comp_name, comp_result in component_results.items():
+    rf_data = comp_result['rf_values']
+    all_rf_values = []
+    for layer_rf in rf_data.values():
+        rf_0_values = np.array(layer_rf['rf_0'])
+        all_rf_values.extend(rf_0_values)
+    
+    if all_rf_values:
+        all_rf_values = np.array(all_rf_values)
+        p30 = np.percentile(all_rf_values[all_rf_values > 0], 30)
+        p50 = np.percentile(all_rf_values[all_rf_values > 0], 50)
+        prunable_30 = sum(1 for val in all_rf_values if val <= p30)
+        prunable_50 = sum(1 for val in all_rf_values if val <= p50)
+        
+        print(f"{comp_name}: 30th percentile prunable: {prunable_30/len(all_rf_values)*100:.1f}%, 50th: {prunable_50/len(all_rf_values)*100:.1f}%")
 
 monitor.remove_hooks()
 print(f"\nBERT analysis complete!")

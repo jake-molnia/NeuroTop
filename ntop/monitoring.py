@@ -123,7 +123,7 @@ class ActivationMonitor:
         self.topology_states = []
     
     def analyze(self, test_loader: DataLoader, epoch: int, description: str = "", 
-                save: bool = False) -> Dict[str, Any]:
+                save: bool = False, **analysis_flags) -> Dict[str, Any]:
         assert hasattr(self, 'analysis_config'), "Analysis configuration not set. Use set_config() to configure analysis."        
             
         device = next(self.model.parameters()).device
@@ -140,11 +140,12 @@ class ActivationMonitor:
         activations = self.get_activations()
         
         from . import analysis
-        params = {**self.analysis_config['analysis_kwargs']}
+        params = {**self.analysis_config['analysis_kwargs'], **analysis_flags}
         state = analysis.analyze(activations, **params)
+        
         rf_info = self._format_rf_output(state)
         if description: 
-            print(f"{description} (Epoch {epoch}): Neurons: {state['total_neurons']}, Betti: {state['betti_numbers']}{rf_info}")
+            print(f"{description} (Epoch {epoch}): {rf_info}")
         if save:
             topology_data = self._prepare_save_data(state, epoch)
             self.topology_states.append(topology_data)
@@ -165,8 +166,21 @@ class ActivationMonitor:
         return dict(np.load(filepath, allow_pickle=True))
     
     def _format_rf_output(self, state: Dict[str, Any]) -> str:
-        assert 'rf_values' in state, "State must contain 'rf_values' key"
-        rf_values = state['rf_values']
+        """Handle nested result structure"""
+        if 'full_network' in state and state['full_network']:
+            return self._format_single_rf_output(state['full_network'])
+        elif 'by_layers' in state and state['by_layers']:
+            layer_count = len(state['by_layers'])
+            return f"Analyzed {layer_count} layers"
+        elif 'by_components' in state and state['by_components']:
+            comp_count = len(state['by_components'])
+            return f"Analyzed {comp_count} components"
+        else:
+            return "No analysis results"
+        
+    def _format_single_rf_output(self, single_state: Dict[str, Any]) -> str:
+        assert 'rf_values' in single_state, "State must contain 'rf_values' key"
+        rf_values = single_state['rf_values']
         rf_dims = set()
         for layer_rf in rf_values.values():
             if isinstance(layer_rf, dict):
@@ -187,13 +201,15 @@ class ActivationMonitor:
             rf_str = ", ".join([f"{dim}_median: {val:.4f}" for dim, val in rf_summary.items()])
             rf_str = f", {rf_str}"
         
-        # Add quantization info if available
-        if 'quantization_info' in state:
-            qinfo = state['quantization_info']
+        if 'quantization_info' in single_state:
+            qinfo = single_state['quantization_info']
             quant_str = f", Compressed: {qinfo['n_original_neurons']}→{qinfo['n_unique_clusters']} ({qinfo['compression_ratio']:.1f}x)"
             rf_str += quant_str
         
-        return rf_str
+        total_neurons = single_state['total_neurons']
+        betti_numbers = single_state['betti_numbers']
+        return f"Neurons: {total_neurons}, Betti: {betti_numbers}{rf_str}"
+
 
     def get_rf_evolution(self) -> Dict[str, Any]:
         assert self.topology_states, "No topology states available. Run analysis with save=True first."
