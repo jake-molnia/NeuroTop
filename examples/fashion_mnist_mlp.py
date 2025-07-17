@@ -70,6 +70,8 @@ monitor.set_config(
     random_seed=42,
     filter_inactive_neurons=True,
     persistence_threshold=0.01,
+    use_quantization=True, 
+    quantization_resolution=0.1,
 )
 
 #%% Run Initial Analysis

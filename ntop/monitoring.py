@@ -67,6 +67,15 @@ def _detect_model_type(model: nn.Module) -> str:
     if any('attention' in name for name in module_names):
         return 'transformer'
     
+    # Check for linear layers in module names or types
+    if any('linear' in name for name in module_names):
+        return 'mlp'
+    
+    # Check for actual Linear module types
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            return 'mlp'
+    
     raise ValueError("Model type could not be detected. Please specify model_type explicitly.")
 
 
@@ -99,11 +108,17 @@ class ActivationMonitor:
         assert self.activations, "No activations captured. Run a forward pass first."
         return self.activations.copy()
     
-    def set_config(self, output_file: str, sequence_strategy: str = 'auto', **analysis_kwargs):
+    def set_config(self, output_file: str, sequence_strategy: str = 'auto', 
+                use_quantization: bool = False, quantization_resolution: float = 0.1,
+                **analysis_kwargs):
         self.sequence_strategy = sequence_strategy
         self.analysis_config = {
             'output_file': output_file,
-            'analysis_kwargs': analysis_kwargs
+            'analysis_kwargs': {
+                'use_quantization': use_quantization,
+                'quantization_resolution': quantization_resolution,
+                **analysis_kwargs
+            }
         }
         self.topology_states = []
     
@@ -167,10 +182,18 @@ class ActivationMonitor:
             if all_rf_values:
                 rf_summary[dim] = np.median(all_rf_values)
         
+        rf_str = ""
         if rf_summary:
             rf_str = ", ".join([f"{dim}_median: {val:.4f}" for dim, val in rf_summary.items()])
-            return f", {rf_str}"
-        return ""
+            rf_str = f", {rf_str}"
+        
+        # Add quantization info if available
+        if 'quantization_info' in state:
+            qinfo = state['quantization_info']
+            quant_str = f", Compressed: {qinfo['n_original_neurons']}→{qinfo['n_unique_clusters']} ({qinfo['compression_ratio']:.1f}x)"
+            rf_str += quant_str
+        
+        return rf_str
 
     def get_rf_evolution(self) -> Dict[str, Any]:
         assert self.topology_states, "No topology states available. Run analysis with save=True first."
