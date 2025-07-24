@@ -12,6 +12,10 @@ from ntop import analysis, plots
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
+# Configure matplotlib to prevent memory issues
+plt.rcParams['figure.max_open_warning'] = 50  # Increase warning threshold
+plt.ioff()  # Turn off interactive mode
+
 #%% Load Data and Model
 def setup_data(subset_size=150):
     """Load and prepare CoLA dataset from GLUE (following paper approach)"""
@@ -59,7 +63,7 @@ monitor.set_config(
     filter_inactive_neurons=True,
     persistence_threshold=0.01,
     use_quantization=True,
-    quantization_resolution=0.1,
+    quantization_resolution=10,
     sequence_strategy='cls',
     analyze_full_network=False,
     analyze_by_layers=False,        
@@ -79,11 +83,15 @@ with torch.no_grad():
         activations, 
         max_dim=2, 
         distance_metric='euclidean',
-        use_quantization=True, 
-        quantization_resolution=5,
-        analyze_by_layers=False,
-        analyze_by_components=True, 
-        analyze_full_network=False
+        normalize_activations='none',
+        random_seed=42,
+        filter_inactive_neurons=False,
+        persistence_threshold=0.001,
+        use_quantization=True,
+        quantization_resolution=10,
+        analyze_full_network=False,
+        analyze_by_layers=False,        
+        analyze_by_components=True,    
     )
 
 #%% Extract Component Results
@@ -106,25 +114,25 @@ for comp_name, comp_result in component_results.items():
     plots.plot_persistence_diagram(comp_result)
     plt.title(f'Persistence Diagram - {comp_name.title()}')
     plt.savefig(f'{output_folder}/persistence_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 for comp_name, comp_result in component_results.items():
     plots.plot_tsne_2d(comp_result)
     plt.title(f't-SNE - {comp_name.title()}')
     plt.savefig(f'{output_folder}/tsne_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 for comp_name, comp_result in component_results.items():
     plots.plot_distance_matrix(comp_result)
     plt.title(f'Distance Matrix - {comp_name.title()}')
     plt.savefig(f'{output_folder}/distance_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 for comp_name, comp_result in component_results.items():
     plots.plot_betti_numbers(comp_result)
     plt.title(f'Betti Numbers - {comp_name.title()}')
     plt.savefig(f'{output_folder}/betti_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 #%% Cross-Component Comparisons
 print("Generating cross-component comparisons...")
@@ -151,7 +159,7 @@ ax.set_title('RF Distribution Comparison')
 ax.legend()
 ax.grid(True, alpha=0.3)
 plt.savefig(f'{output_folder}/rf_comparison.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 # Betti Number Comparison
 fig, ax = plt.subplots(figsize=(12, 6))
@@ -175,7 +183,7 @@ ax.set_xticklabels([comp.title() for comp in comp_names])
 ax.legend()
 ax.grid(True, alpha=0.3, axis='y')
 plt.savefig(f'{output_folder}/betti_comparison.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 # Component Size Comparison
 fig, ax = plt.subplots(figsize=(10, 6))
@@ -193,7 +201,7 @@ for bar, count in zip(bars, neuron_counts):
 
 plt.xticks(rotation=45)
 plt.savefig(f'{output_folder}/size_comparison.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 # RF Median Comparison
 fig, ax = plt.subplots(figsize=(10, 6))
@@ -218,7 +226,7 @@ for bar, median in zip(bars, medians):
 
 plt.xticks(rotation=45)
 plt.savefig(f'{output_folder}/rf_medians.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 #%% Attention Sub-Components
 if 'attention' in component_results:
@@ -255,7 +263,7 @@ if 'attention' in component_results:
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.savefig(f'{output_folder}/attention_subcomponents.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 #%% Feedforward Sub-Components
 if 'feedforward' in component_results:
@@ -288,7 +296,7 @@ if 'feedforward' in component_results:
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.savefig(f'{output_folder}/feedforward_subcomponents.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 #%% RF Heatmap Analysis
 print("Generating RF heatmap visualizations...")
@@ -307,13 +315,13 @@ for comp_name, comp_result in component_results.items():
     plots.plot_rf_distribution_evolution(fake_topology_states, 'rf_0')
     plt.suptitle(f'RF Distribution - {comp_name.title()}')
     plt.savefig(f'{output_folder}/rf_distribution_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
     
     # RF box evolution (static for single snapshot)  
     plots.plot_rf_box_evolution(fake_topology_states, 'rf_0')
     plt.suptitle(f'RF Statistics - {comp_name.title()}')
     plt.savefig(f'{output_folder}/rf_box_{comp_name}.png', dpi=150, bbox_inches='tight')
-    # plt.show()
+    plt.close()  # Close the figure to free memory
 
 # Network-wide RF comparison across components
 print("Generating network-wide RF analysis...")
@@ -335,12 +343,12 @@ network_topology_state = [{
 plots.plot_rf_distribution_evolution_network(network_topology_state, 'rf_0')
 plt.title('Network-wide RF Distribution (All Components)')
 plt.savefig(f'{output_folder}/rf_network_distribution.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 plots.plot_rf_box_evolution_network(network_topology_state, 'rf_0')
 plt.title('Network-wide RF Statistics (All Components)')
 plt.savefig(f'{output_folder}/rf_network_box.png', dpi=150, bbox_inches='tight')
-# plt.show()
+plt.close()  # Close the figure to free memory
 
 #%% Compression Analysis
 print(f"\nBERT Compression Analysis")
@@ -366,4 +374,8 @@ for comp_name, comp_result in component_results.items():
         print(f"{comp_name}: 30th percentile prunable: {prunable_30/len(all_rf_values)*100:.1f}%, 50th: {prunable_50/len(all_rf_values)*100:.1f}%")
 
 monitor.remove_hooks()
+
+# Final cleanup - close any remaining figures
+plt.close('all')
+
 print(f"\nBERT analysis complete!")
