@@ -117,7 +117,7 @@ monitor = ActivationMonitor(model)
 monitor.set_config(
     output_file='./outputs/ablation_test.npz',
     max_samples=500,
-    distance_metric='euclidean',
+    distance_metric='manhattan',
     normalize_activations='none',
     max_dim=1,
     random_seed=42,
@@ -223,19 +223,6 @@ plt.grid(True, alpha=0.3)
 # Set axis limits for better visualization
 plt.xlim(0, 100)
 plt.ylim(0, max(original_accuracy, max(rf_accuracies), max(random_accuracies)) + 5)
-
-# Add annotations for key differences at specific points
-key_points = [10, 25, 50, 75, 90]
-for point in key_points:
-    if point < len(percentages):
-        diff = rf_accuracies[point-1] - random_accuracies[point-1]  # -1 because list is 0-indexed
-        if abs(diff) > 1:  # Only annotate significant differences
-            plt.annotate(f'{diff:+.1f}%', 
-                        xy=(point, max(rf_accuracies[point-1], random_accuracies[point-1])), 
-                        xytext=(0, 15), textcoords='offset points',
-                        ha='center', fontsize=9, alpha=0.8,
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.5))
-
 plt.tight_layout()
 
 # Save the plot
