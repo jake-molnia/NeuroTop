@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from torch.utils.data import DataLoader
 import numpy as np
+import copy
 
 
 class ModelAdapter:
@@ -141,7 +142,8 @@ class ActivationMonitor:
         
         from . import analysis
         params = {**self.analysis_config['analysis_kwargs'], **analysis_flags}
-        state = analysis.analyze(activations, **params)
+        state = analysis.analyze(activations, **params)        
+        self.last_analysis = state
         
         rf_info = self._format_rf_output(state)
         if description: 
@@ -279,3 +281,120 @@ class ActivationMonitor:
             handle.remove()
         self.hooks = []
         self.activations = {}
+
+    def ablate(self, model: nn.Module, strategy: str, value: float, rf_dim: str = 'rf_0', 
+            state: Optional[Dict[str, Any]] = None) -> nn.Module:
+        """
+        Ablate neurons based on RF importance scores
+        
+        Args:
+            model: PyTorch model to ablate
+            strategy: 'percent' or 'random'
+            value: percentage (0-100) of neurons to ablate
+            rf_dim: which RF dimension to use for importance ('rf_0', 'rf_1', etc.)
+            state: analysis state to use (if None, uses last_analysis)
+        
+        Returns:
+            Copy of model with selected neurons masked (set to 0)
+        """
+        # Validation
+        assert hasattr(self, 'last_analysis') or state is not None, \
+            "Must run analyze() first or provide analysis state"
+        assert strategy in ['percent', 'random'], f"Invalid strategy: {strategy}. Use 'percent' or 'random'"
+        assert 0 <= value <= 100, f"Value must be 0-100, got {value}"
+        
+        # Use provided state or last analysis
+        analysis_state = state if state is not None else self.last_analysis
+        
+        # Handle nested analysis results (by_components, by_layers, full_network)
+        if 'full_network' in analysis_state:
+            rf_values = analysis_state['full_network']['rf_values']
+            neuron_selection = self._select_neurons(rf_values, strategy, value, rf_dim)
+        elif 'by_components' in analysis_state:
+            # Combine all components for global selection
+            combined_rf = {}
+            for comp_name, comp_data in analysis_state['by_components'].items():
+                combined_rf.update(comp_data['rf_values'])
+            neuron_selection = self._select_neurons(combined_rf, strategy, value, rf_dim)
+        elif 'by_layers' in analysis_state:
+            # Combine all layers for global selection
+            combined_rf = {}
+            for layer_num, layer_data in analysis_state['by_layers'].items():
+                combined_rf.update(layer_data['rf_values'])
+            neuron_selection = self._select_neurons(combined_rf, strategy, value, rf_dim)
+        else:
+            raise ValueError("Analysis state must contain 'full_network', 'by_components', or 'by_layers'")
+        return self._mask_neurons(model, neuron_selection)
+
+    def _select_neurons(self, rf_values: Dict[str, Dict[str, np.ndarray]], 
+                    strategy: str, percentage: float, rf_dim: str) -> List[Tuple[str, int]]:
+        """
+        Select neurons to ablate based on strategy
+        
+        Returns:
+            List of (layer_name, neuron_index) tuples to mask
+        """
+        all_neurons = []
+        
+        # Collect all neurons with their RF values
+        for layer_name, layer_rf in rf_values.items():
+            assert rf_dim in layer_rf, f"RF dimension {rf_dim} not found in layer {layer_name}"
+            
+            rf_scores = layer_rf[rf_dim]
+            for neuron_idx, rf_score in enumerate(rf_scores):
+                all_neurons.append((layer_name, neuron_idx, rf_score))
+        
+        # Select neurons based on strategy
+        num_to_select = int(len(all_neurons) * percentage / 100)
+        
+        if strategy == 'percent':
+            # Sort by RF score (ascending) and take lowest percentage
+            all_neurons.sort(key=lambda x: x[2])  # Sort by RF score
+            selected = all_neurons[:num_to_select]
+        elif strategy == 'random':
+            # Randomly select percentage of neurons
+            import random
+            selected = random.sample(all_neurons, num_to_select)
+        
+        # Return (layer_name, neuron_index) pairs
+        return [(layer_name, neuron_idx) for layer_name, neuron_idx, _ in selected]
+
+    def _mask_neurons(self, model: nn.Module, neuron_selection: List[Tuple[str, int]]) -> nn.Module:
+        """
+        Create a copy of the model with selected neurons masked (set to 0)
+        """
+        # Create deep copy of the model
+        ablated_model = copy.deepcopy(model)
+        
+        # Group selections by layer for efficient masking
+        layer_masks = {}
+        for layer_name, neuron_idx in neuron_selection:
+            if layer_name not in layer_masks:
+                layer_masks[layer_name] = []
+            layer_masks[layer_name].append(neuron_idx)
+        
+        # Apply masks to each layer
+        for layer_name, neuron_indices in layer_masks.items():
+            # Find the corresponding module in the model
+            module = self._get_module_by_name(ablated_model, layer_name)
+            
+            if isinstance(module, nn.Linear):
+                # Mask weights and biases
+                for neuron_idx in neuron_indices:
+                    # Zero out outgoing weights (this neuron's effect on next layer)
+                    module.weight.data[neuron_idx, :] = 0
+                    if module.bias is not None:
+                        module.bias.data[neuron_idx] = 0
+            else:
+                print(f"Warning: Cannot mask module type {type(module)} for layer {layer_name}")
+        
+        return ablated_model
+
+    def _get_module_by_name(self, model: nn.Module, layer_name: str) -> nn.Module:
+        """
+        Get a module from the model by its registered name from hooks
+        """
+        for name, module in model.named_modules():
+            if name == layer_name:
+                return module
+        raise ValueError(f"Module {layer_name} not found in model")
