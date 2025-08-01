@@ -105,11 +105,10 @@ class ActivationMonitor:
         self.sequence_strategy = 'auto'
         
         self._register_hooks()
-    
+
     def _register_hooks(self):
-        """Register hooks by monkey patching __call__ methods"""
-        def find_hookable_modules(obj, prefix=""):
-            modules = []
+        def find_tensors(obj, prefix=""):
+            tensors = []
             for attr_name in dir(obj):
                 if attr_name.startswith('_'):
                     continue
@@ -117,36 +116,17 @@ class ActivationMonitor:
                     attr = getattr(obj, attr_name)
                     full_name = f"{prefix}.{attr_name}" if prefix else attr_name
                     
-                    if self.adapter.should_hook(full_name, attr):
-                        print(f"[DEBUG] Will hook: {full_name} ({type(attr)})")
-                        modules.append((full_name, attr))
+                    if isinstance(attr, Tensor) and attr_name == 'weight':
+                        tensors.append((full_name, attr))
                     elif hasattr(attr, '__dict__') and not isinstance(attr, (type, Tensor)):
-                        modules.extend(find_hookable_modules(attr, full_name))
+                        tensors.extend(find_tensors(attr, full_name))
                 except:
                     continue
-            return modules
+            return tensors
         
-        hookable_modules = find_hookable_modules(self.model)
-        
-        for name, module in hookable_modules:
-            if hasattr(module, '__call__'):
-                # Store original method
-                self.original_methods[name] = module.__call__
-                
-                # Create hook wrapper
-                def make_hook(orig_method, hook_name):
-                    def hooked_call(*args, **kwargs):
-                        print(f"[DEBUG] Hooked __call__ for {hook_name} with args={args}, kwargs={kwargs}")
-                        result = orig_method(*args, **kwargs)
-                        processed_output = self.adapter.process_output(result, self.sequence_strategy)
-                        print(f"[DEBUG] Captured activation for {hook_name}: shape={getattr(processed_output, 'shape', None)}")
-                        self.activations[hook_name] = processed_output
-                        return result
-                    return hooked_call
-                
-                # Replace method with hooked version
-                module.__call__ = make_hook(self.original_methods[name], name)
-                self.hooks.append((name, module))
+        # Hook weight tensors instead of __call__ methods
+        weight_tensors = find_tensors(self.model)
+        print(f"Found {len(weight_tensors)} weight tensors to monitor")
     
     def get_activations(self) -> Dict[str, np.ndarray]:
         assert self.activations, "No activations captured. Run a forward pass first."
@@ -165,7 +145,7 @@ class ActivationMonitor:
             }
         }
         self.topology_states = []
-    
+
     def analyze(self, test_loader, epoch: int, description: str = "", 
                 save: bool = False, **analysis_flags) -> Dict[str, Any]:
         assert hasattr(self, 'analysis_config'), "Analysis configuration not set. Use set_config() to configure analysis."        
@@ -173,22 +153,32 @@ class ActivationMonitor:
         # Clear previous activations
         self.activations = {}
         
-        # Run forward pass to capture activations
+        # Run forward pass to build UOp graph (no hooks needed!)
         data_batch = next(iter(test_loader))
         args, kwargs = self.adapter.process_batch(data_batch)
         
+        print("DEBUG: Running forward pass to build UOp graph...")
         if args is not None:
-            _ = self.model(args)
+            output = self.model(args)
         else:
-            _ = self.model(**kwargs)
+            output = self.model(**kwargs)
         
-        # Get captured activations and convert to torch tensors for analysis
-        tinygrad_activations = self.get_activations()
+        print("DEBUG: Extracting activations from UOp graph...")
+        # Extract activations from UOp graph
+        self.activations = self._extract_from_uop_graph(output, data_batch)
         
-        # Convert numpy arrays back to torch tensors for existing analysis
+        print(f"DEBUG: Extracted {len(self.activations)} activations")
+        for name in self.activations:
+            print(f"  {name}: shape {self.activations[name].shape}")
+        
+        if not self.activations:
+            print("WARNING: No activations extracted! Falling back to direct module execution...")
+            self.activations = self._extract_activations_directly(data_batch)
+        
+        # Convert numpy arrays to torch tensors for existing analysis
         import torch
         torch_activations = {}
-        for name, activation in tinygrad_activations.items():
+        for name, activation in self.activations.items():
             torch_activations[name] = torch.from_numpy(activation).float()
         
         # Use existing analysis
@@ -205,6 +195,229 @@ class ActivationMonitor:
             self.topology_states.append(topology_data)
             self._save_analysis()
         return state
+
+    def _extract_from_uop_graph(self, output, data_batch):
+        """Extract intermediate activations from tinygrad's UOp graph"""
+        activations = {}
+        visited = set()
+        
+        # Store weight tensors for identification
+        self._build_weight_tensor_map()
+        
+        def walk_uop(uop, depth=0):
+            if id(uop) in visited or depth > 20:  # Prevent infinite recursion
+                return
+            visited.add(id(uop))
+            
+            # Check if this UOp corresponds to a module we care about
+            module_name = self._identify_module_from_uop(uop)
+            if module_name:
+                try:
+                    print(f"DEBUG: Found UOp for {module_name} at depth {depth}")
+                    # Extract activation from this UOp
+                    activation = self._extract_activation_from_uop(uop)
+                    if activation is not None:
+                        processed = self.adapter.process_output(activation, self.sequence_strategy)
+                        activations[module_name] = processed
+                        print(f"DEBUG: Extracted activation for {module_name}: shape {processed.shape}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to extract activation for {module_name}: {e}")
+            
+            # Recursively walk source UOps
+            if hasattr(uop, 'src') and uop.src:
+                for src_uop in uop.src:
+                    walk_uop(src_uop, depth + 1)
+        
+        # Start walking from output tensor(s)
+        if isinstance(output, dict):
+            for key, tensor in output.items():
+                if hasattr(tensor, 'uop'):
+                    print(f"DEBUG: Walking UOp graph from output['{key}']")
+                    walk_uop(tensor.uop)
+        elif hasattr(output, 'uop'):
+            print("DEBUG: Walking UOp graph from single output")
+            walk_uop(output.uop)
+        else:
+            print(f"DEBUG: Output type {type(output)} has no uop attribute")
+        
+        return activations
+
+    def _build_weight_tensor_map(self):
+        """Build mapping from weight tensors to module names"""
+        self.weight_tensor_map = {}
+        
+        for name, module in self.hooks:  # Use the modules we identified for hooking
+            if hasattr(module, 'weight') and isinstance(module.weight, Tensor):
+                # Store the weight tensor ID and corresponding module name
+                self.weight_tensor_map[id(module.weight.uop)] = name
+                print(f"DEBUG: Mapped weight tensor for {name}")
+
+    def _identify_module_from_uop(self, uop):
+        """Try to identify which module this UOp corresponds to"""
+        # Check if this UOp uses any of our tracked weight tensors
+        if hasattr(uop, 'src') and uop.src:
+            for src_uop in uop.src:
+                if id(src_uop) in self.weight_tensor_map:
+                    return self.weight_tensor_map[id(src_uop)]
+        
+        # Pattern matching for common operations
+        if hasattr(uop, 'op'):
+            # Look for linear layer patterns (matrix multiplication)
+            if str(uop.op) in ['DOT', 'MATMUL'] and hasattr(uop, 'src') and len(uop.src) >= 2:
+                # This might be a linear layer - check if we can identify it
+                for src_uop in uop.src:
+                    if id(src_uop) in self.weight_tensor_map:
+                        return self.weight_tensor_map[id(src_uop)]
+            
+            # Look for layer norm patterns
+            if str(uop.op) in ['MUL', 'ADD'] and self._looks_like_layer_norm(uop):
+                return self._find_layer_norm_module(uop)
+        
+        return None
+
+    def _looks_like_layer_norm(self, uop):
+        """Check if UOp pattern looks like layer normalization"""
+        # Layer norm typically involves mean, variance computation, then normalize
+        # This is a heuristic - might need refinement
+        if not hasattr(uop, 'src') or len(uop.src) < 2:
+            return False
+        
+        # Look for patterns involving statistics computation
+        for src_uop in uop.src:
+            if hasattr(src_uop, 'op') and str(src_uop.op) in ['REDUCE', 'SUM']:
+                return True
+        return False
+
+    def _find_layer_norm_module(self, uop):
+        """Try to identify which layer norm this UOp belongs to"""
+        # This is heuristic - match against known layer norm modules
+        for name, module in self.hooks:
+            if 'layer_norm' in name.lower() or 'layernorm' in name.lower():
+                return name
+        return None
+
+    def _extract_activation_from_uop(self, uop):
+        """Extract activation tensor from UOp"""
+        try:
+            # Try to create a tensor from the UOp and realize it
+            if hasattr(uop, 'dtype') and hasattr(uop, 'shape'):
+                # Create tensor from UOp - this might need adjustment based on tinygrad version
+                from tinygrad.tensor import Tensor
+                
+                # Different approaches to try
+                try:
+                    # Approach 1: Direct tensor creation from UOp
+                    tensor = Tensor(uop=uop)
+                    return tensor
+                except:
+                    # Approach 2: If UOp is already realized
+                    if hasattr(uop, 'realized') and uop.realized:
+                        return Tensor(uop.realized.toCPU())
+                    else:
+                        # Approach 3: Create tensor and realize
+                        temp_tensor = Tensor(uop=uop)
+                        temp_tensor.realize()
+                        return temp_tensor
+        except Exception as e:
+            print(f"DEBUG: Failed to extract tensor from UOp: {e}")
+            return None
+
+    def _extract_activations_directly(self, data_batch):
+        """Fallback: Extract activations by running modules directly"""
+        print("DEBUG: Using direct module execution fallback...")
+        activations = {}
+        
+        try:
+            args, kwargs = self.adapter.process_batch(data_batch)
+            
+            # For BERT models, manually trace through execution
+            if hasattr(self.model, 'bert'):
+                print("DEBUG: Detected BERT model, tracing execution...")
+                
+                # Get inputs
+                if args is not None:
+                    input_ids = args
+                    attention_mask = None
+                    token_type_ids = None
+                else:
+                    input_ids = kwargs['input_ids']
+                    attention_mask = kwargs.get('attention_mask', None)
+                    token_type_ids = kwargs.get('token_type_ids', None)
+                
+                # Run embeddings
+                embedding_output = self.model.bert.embeddings(input_ids, token_type_ids)
+                
+                # Capture embeddings layer norm if it exists
+                if hasattr(self.model.bert.embeddings, 'layer_norm'):
+                    try:
+                        ln_output = self.model.bert.embeddings.layer_norm(embedding_output)
+                        ln_output.realize()  # Force computation
+                        processed = self.adapter.process_output(ln_output, self.sequence_strategy)
+                        activations['bert.embeddings.layer_norm'] = processed
+                        print(f"DEBUG: Captured embeddings layer_norm: {processed.shape}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to capture embeddings layer_norm: {e}")
+                
+                # Run encoder
+                encoder_output = self.model.bert.encoder(embedding_output, attention_mask)
+                
+                # Run pooler
+                pooled_output = self.model.bert.pooler(encoder_output)
+                
+                # Capture pooler dense
+                if hasattr(self.model.bert.pooler, 'dense'):
+                    try:
+                        # The pooler.dense is already called inside pooler, so we get the result
+                        pooled_output.realize()  # Force computation
+                        processed = self.adapter.process_output(pooled_output, self.sequence_strategy)
+                        activations['bert.pooler.dense'] = processed
+                        print(f"DEBUG: Captured pooler.dense: {processed.shape}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to capture pooler.dense: {e}")
+                
+                # Run classifier
+                if hasattr(self.model, 'classifier'):
+                    try:
+                        classifier_output = self.model.classifier(pooled_output)
+                        classifier_output.realize()  # Force computation
+                        processed = self.adapter.process_output(classifier_output, self.sequence_strategy)
+                        activations['classifier'] = processed
+                        print(f"DEBUG: Captured classifier: {processed.shape}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to capture classifier: {e}")
+                
+                # Capture other modules we care about
+                for name, module in self.hooks:
+                    if name not in activations:
+                        try:
+                            # Try to run the module on appropriate input
+                            if 'embedding' in name:
+                                test_output = module(input_ids)
+                            elif 'pooler' in name:
+                                test_output = module(encoder_output)
+                            elif 'classifier' in name:
+                                test_output = module(pooled_output)
+                            else:
+                                # Skip modules we can't easily trace
+                                continue
+                            
+                            test_output.realize()
+                            processed = self.adapter.process_output(test_output, self.sequence_strategy)
+                            activations[name] = processed
+                            print(f"DEBUG: Captured {name}: {processed.shape}")
+                        except Exception as e:
+                            print(f"DEBUG: Failed to capture {name}: {e}")
+            
+            else:
+                print("DEBUG: Non-BERT model - using generic approach")
+                # For non-BERT models, try running each hooked module individually
+                # This is more generic but less reliable
+                pass
+                
+        except Exception as e:
+            print(f"DEBUG: Direct extraction failed: {e}")
+        
+        return activations
         
     def _save_analysis(self):
         assert self.topology_states, "No topology states to save"
@@ -310,20 +523,69 @@ class ActivationMonitor:
         return rf_evolution
     
     def _prepare_save_data(self, state: Dict[str, Any], epoch: int) -> Dict[str, Any]:
-        topology_data = {
-            'epoch': epoch,
-            'neuron_matrix': state['neuron_matrix'],
-            'neuron_info': state['neuron_info'],
-            'distance_matrix': state['distance_matrix'],
-            'persistence': state['persistence'],
-            'betti_numbers': state['betti_numbers'],
-            'total_neurons': state['total_neurons'],
-            'n_samples': state['n_samples'],
-            'distance_metric': state['distance_metric']
-        }
+        topology_data = {'epoch': epoch}
         
-        if 'rf_values' in state:
-            topology_data['rf_values'] = state['rf_values']
+        # Handle nested analysis structure (by_components, by_layers, full_network)
+        if 'by_components' in state:
+            topology_data['by_components'] = state['by_components']
+            # Also extract summary statistics
+            total_neurons = sum(comp_data['total_neurons'] for comp_data in state['by_components'].values())
+            topology_data['total_neurons'] = total_neurons
+            
+            # Extract RF values from all components
+            all_rf_values = {}
+            for comp_name, comp_data in state['by_components'].items():
+                if 'rf_values' in comp_data:
+                    all_rf_values.update(comp_data['rf_values'])
+            if all_rf_values:
+                topology_data['rf_values'] = all_rf_values
+        
+        elif 'by_layers' in state:
+            topology_data['by_layers'] = state['by_layers']
+            # Extract summary statistics
+            total_neurons = sum(layer_data['total_neurons'] for layer_data in state['by_layers'].values())
+            topology_data['total_neurons'] = total_neurons
+            
+            # Extract RF values from all layers
+            all_rf_values = {}
+            for layer_num, layer_data in state['by_layers'].items():
+                if 'rf_values' in layer_data:
+                    all_rf_values.update(layer_data['rf_values'])
+            if all_rf_values:
+                topology_data['rf_values'] = all_rf_values
+        
+        elif 'full_network' in state:
+            # Single network analysis - use original structure
+            network_data = state['full_network']
+            topology_data.update({
+                'neuron_matrix': network_data['neuron_matrix'],
+                'neuron_info': network_data['neuron_info'],
+                'distance_matrix': network_data['distance_matrix'],
+                'persistence': network_data['persistence'],
+                'betti_numbers': network_data['betti_numbers'],
+                'total_neurons': network_data['total_neurons'],
+                'n_samples': network_data['n_samples'],
+                'distance_metric': network_data['distance_metric']
+            })
+            
+            if 'rf_values' in network_data:
+                topology_data['rf_values'] = network_data['rf_values']
+        
+        else:
+            # Fallback - assume flat structure (old format)
+            topology_data.update({
+                'neuron_matrix': state.get('neuron_matrix'),
+                'neuron_info': state.get('neuron_info'),
+                'distance_matrix': state.get('distance_matrix'),
+                'persistence': state.get('persistence'),
+                'betti_numbers': state.get('betti_numbers'),
+                'total_neurons': state.get('total_neurons'),
+                'n_samples': state.get('n_samples'),
+                'distance_metric': state.get('distance_metric')
+            })
+            
+            if 'rf_values' in state:
+                topology_data['rf_values'] = state['rf_values']
         
         return topology_data
 

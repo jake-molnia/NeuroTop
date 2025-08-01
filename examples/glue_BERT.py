@@ -243,7 +243,7 @@ monitor.set_config(
     normalize_activations='none',
     max_dim=2,
     random_seed=42,
-    filter_inactive_neurons=True,
+    filter_inactive_neurons=False,
     persistence_threshold=0.01,
     use_quantization=True,
     quantization_resolution=0.1,

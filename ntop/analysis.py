@@ -237,7 +237,7 @@ def _detect_components(activations: Dict[str, torch.Tensor]) -> Dict[str, Dict[s
     """Auto-detect components (attention, feedforward, etc.) and group them"""
     print("DEBUG: Grouping by components...")
     
-    components = {'attention': {}, 'feedforward': {}, 'embeddings': {}, 'pooler': {}}
+    components = {'attention': {}, 'feedforward': {}, 'embeddings': {}, 'pooler': {}, 'classifier': {}}  # Added 'classifier'
     unrecognized = []
     
     for layer_name, layer_acts in activations.items():
@@ -258,6 +258,10 @@ def _detect_components(activations: Dict[str, torch.Tensor]) -> Dict[str, Dict[s
         # Pooler
         elif 'pooler' in name_lower:
             components['pooler'][layer_name] = layer_acts
+            
+        # Classifier (ADD THIS SECTION)
+        elif 'classifier' in name_lower:
+            components['classifier'][layer_name] = layer_acts
             
         else:
             unrecognized.append(layer_name)
