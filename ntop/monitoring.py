@@ -1,91 +1,104 @@
-import torch
-import torch.nn as nn
+from tinygrad.tensor import Tensor
 from typing import Dict, List, Optional, Any, Tuple
-from torch.utils.data import DataLoader
 import numpy as np
 import copy
 
 
 class ModelAdapter:
-    def should_hook(self, name: str, module: nn.Module) -> bool:
-        return isinstance(module, nn.Linear)
+    def should_hook(self, name: str, module: Any) -> bool:
+        return hasattr(module, 'weight') and hasattr(module, '__call__')
     
-    def process_batch(self, data_batch, device):
+    def process_batch(self, data_batch, device=None):
         if isinstance(data_batch, (list, tuple)):
-            return data_batch[0].to(device), {}
+            return data_batch[0], {}
         else:
-            return data_batch.to(device), {}
+            return data_batch, {}
     
     def process_output(self, output, strategy):
         if strategy == 'auto':
-            if output.dim() == 3 and output.size(1) > 1:
-                return output[:, 0, :].detach().clone()
+            if len(output.shape) == 3 and output.shape[1] > 1:
+                return output[:, 0, :].numpy()
             else:
-                return output.detach().clone()
+                return output.numpy()
         elif strategy == 'cls':
-            if output.dim() == 3:
-                return output[:, 0, :].detach().clone()
+            if len(output.shape) == 3:
+                return output[:, 0, :].numpy()
             else:
-                return output.detach().clone()
+                return output.numpy()
         elif strategy == 'full':
-            return output.detach().clone()
+            return output.numpy()
         elif strategy == 'mean':
-            if output.dim() == 3:
-                return output.mean(dim=1).detach().clone()
+            if len(output.shape) == 3:
+                return output.mean(axis=1).numpy()
             else:
-                return output.detach().clone()
+                return output.numpy()
         else:
-            return output.detach().clone()
+            return output.numpy()
 
 
 class TransformerAdapter(ModelAdapter):
-    def should_hook(self, name: str, module: nn.Module) -> bool:
-        if isinstance(module, nn.Linear):
+    def should_hook(self, name: str, module: Any) -> bool:
+        if hasattr(module, 'weight') and hasattr(module, '__call__'):
             return True
         if hasattr(module, 'weight') and hasattr(module, 'bias'):
-            module_type = str(type(module)).lower()
-            return any(x in module_type for x in ['linear', 'dense', 'projection'])
+            return True
         return False
     
-    def process_batch(self, data_batch, device):
+    def process_batch(self, data_batch, device=None):
         if isinstance(data_batch, dict):
             bert_keys = {'input_ids', 'attention_mask', 'token_type_ids', 'position_ids'}
-            data = {k: v.to(device) for k, v in data_batch.items() 
-                   if k in bert_keys and hasattr(v, 'to')}
+            data = {k: v for k, v in data_batch.items() if k in bert_keys}
             return None, data
         elif isinstance(data_batch, (list, tuple)):
-            return data_batch[0].to(device), {}
+            return data_batch[0], {}
         else:
-            return data_batch.to(device), {}
+            return data_batch, {}
 
 
-def _detect_model_type(model: nn.Module) -> str:
+def _detect_model_type(model: Any) -> str:
     model_type = str(type(model)).lower()
     if any(x in model_type for x in ['bert', 'roberta', 'distilbert', 'transformer']):
         return 'transformer'
     
-    module_names = [name.lower() for name, _ in model.named_modules()]
-    if any('attention' in name for name in module_names):
+    # Check for attention in attribute names
+    attr_names = []
+    def collect_attrs(obj, prefix=""):
+        for attr_name in dir(obj):
+            if not attr_name.startswith('_'):
+                attr_names.append(f"{prefix}.{attr_name}" if prefix else attr_name)
+                try:
+                    attr = getattr(obj, attr_name)
+                    if hasattr(attr, '__dict__') and not isinstance(attr, type):
+                        collect_attrs(attr, f"{prefix}.{attr_name}" if prefix else attr_name)
+                except:
+                    continue
+    
+    collect_attrs(model)
+    if any('attention' in name.lower() for name in attr_names):
         return 'transformer'
     
-    # Check for linear layers in module names or types
-    if any('linear' in name for name in module_names):
+    # Check for linear layers
+    if any('linear' in name.lower() for name in attr_names):
         return 'mlp'
     
-    # Check for actual Linear module types
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            return 'mlp'
+    # Check for actual weight tensors
+    for attr_name in dir(model):
+        try:
+            attr = getattr(model, attr_name)
+            if isinstance(attr, Tensor):
+                return 'mlp'
+        except:
+            continue
     
     raise ValueError("Model type could not be detected. Please specify model_type explicitly.")
 
 
 class ActivationMonitor:
-    def __init__(self, model: nn.Module, model_type: Optional[str] = None):
-        assert isinstance(model, nn.Module), "Model must be a PyTorch nn.Module"
+    def __init__(self, model: Any, model_type: Optional[str] = None):
         self.model = model
         self.activations = {}
         self.hooks = []
+        self.original_methods = {}
         
         model_type = model_type or _detect_model_type(model)
         self.adapter = TransformerAdapter() if model_type == 'transformer' else ModelAdapter()
@@ -94,18 +107,48 @@ class ActivationMonitor:
         self._register_hooks()
     
     def _register_hooks(self):
-        for name, module in self.model.named_modules():
-            if self.adapter.should_hook(name, module):
-                handle = module.register_forward_hook(self._hook_fn(name))
-                self.hooks.append(handle)
+        """Register hooks by monkey patching __call__ methods"""
+        def find_hookable_modules(obj, prefix=""):
+            modules = []
+            for attr_name in dir(obj):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    attr = getattr(obj, attr_name)
+                    full_name = f"{prefix}.{attr_name}" if prefix else attr_name
+                    
+                    if self.adapter.should_hook(full_name, attr):
+                        print(f"[DEBUG] Will hook: {full_name} ({type(attr)})")
+                        modules.append((full_name, attr))
+                    elif hasattr(attr, '__dict__') and not isinstance(attr, (type, Tensor)):
+                        modules.extend(find_hookable_modules(attr, full_name))
+                except:
+                    continue
+            return modules
+        
+        hookable_modules = find_hookable_modules(self.model)
+        
+        for name, module in hookable_modules:
+            if hasattr(module, '__call__'):
+                # Store original method
+                self.original_methods[name] = module.__call__
+                
+                # Create hook wrapper
+                def make_hook(orig_method, hook_name):
+                    def hooked_call(*args, **kwargs):
+                        print(f"[DEBUG] Hooked __call__ for {hook_name} with args={args}, kwargs={kwargs}")
+                        result = orig_method(*args, **kwargs)
+                        processed_output = self.adapter.process_output(result, self.sequence_strategy)
+                        print(f"[DEBUG] Captured activation for {hook_name}: shape={getattr(processed_output, 'shape', None)}")
+                        self.activations[hook_name] = processed_output
+                        return result
+                    return hooked_call
+                
+                # Replace method with hooked version
+                module.__call__ = make_hook(self.original_methods[name], name)
+                self.hooks.append((name, module))
     
-    def _hook_fn(self, name: str):
-        def hook(module, input, output):
-            processed_output = self.adapter.process_output(output, self.sequence_strategy)
-            self.activations[name] = processed_output
-        return hook
-    
-    def get_activations(self) -> Dict[str, torch.Tensor]:
+    def get_activations(self) -> Dict[str, np.ndarray]:
         assert self.activations, "No activations captured. Run a forward pass first."
         return self.activations.copy()
     
@@ -123,26 +166,35 @@ class ActivationMonitor:
         }
         self.topology_states = []
     
-    def analyze(self, test_loader: DataLoader, epoch: int, description: str = "", 
+    def analyze(self, test_loader, epoch: int, description: str = "", 
                 save: bool = False, **analysis_flags) -> Dict[str, Any]:
         assert hasattr(self, 'analysis_config'), "Analysis configuration not set. Use set_config() to configure analysis."        
-            
-        device = next(self.model.parameters()).device
-        self.model.eval()
-        with torch.no_grad():
-            data_batch = next(iter(test_loader))
-            args, kwargs = self.adapter.process_batch(data_batch, device)
-            
-            if args is not None:
-                _ = self.model(args)
-            else:
-                _ = self.model(**kwargs)
         
-        activations = self.get_activations()
+        # Clear previous activations
+        self.activations = {}
         
+        # Run forward pass to capture activations
+        data_batch = next(iter(test_loader))
+        args, kwargs = self.adapter.process_batch(data_batch)
+        
+        if args is not None:
+            _ = self.model(args)
+        else:
+            _ = self.model(**kwargs)
+        
+        # Get captured activations and convert to torch tensors for analysis
+        tinygrad_activations = self.get_activations()
+        
+        # Convert numpy arrays back to torch tensors for existing analysis
+        import torch
+        torch_activations = {}
+        for name, activation in tinygrad_activations.items():
+            torch_activations[name] = torch.from_numpy(activation).float()
+        
+        # Use existing analysis
         from . import analysis
         params = {**self.analysis_config['analysis_kwargs'], **analysis_flags}
-        state = analysis.analyze(activations, **params)        
+        state = analysis.analyze(torch_activations, **params)        
         self.last_analysis = state
         
         rf_info = self._format_rf_output(state)
@@ -212,7 +264,6 @@ class ActivationMonitor:
         betti_numbers = single_state['betti_numbers']
         return f"Neurons: {total_neurons}, Betti: {betti_numbers}{rf_str}"
 
-
     def get_rf_evolution(self) -> Dict[str, Any]:
         assert self.topology_states, "No topology states available. Run analysis with save=True first."
         epochs = [s['epoch'] for s in self.topology_states]
@@ -277,18 +328,21 @@ class ActivationMonitor:
         return topology_data
 
     def remove_hooks(self):
-        for handle in self.hooks:
-            handle.remove()
+        """Restore original methods"""
+        for name, module in self.hooks:
+            if name in self.original_methods:
+                module.__call__ = self.original_methods[name]
         self.hooks = []
+        self.original_methods = {}
         self.activations = {}
 
-    def ablate(self, model: nn.Module, strategy: str, value: float, rf_dim: str = 'rf_0', 
-            state: Optional[Dict[str, Any]] = None) -> nn.Module:
+    def ablate(self, model: Any, strategy: str, value: float, rf_dim: str = 'rf_0', 
+            state: Optional[Dict[str, Any]] = None) -> Any:
         """
         Ablate neurons based on RF importance scores
         
         Args:
-            model: PyTorch model to ablate
+            model: tinygrad model to ablate
             strategy: 'percent' or 'random'
             value: percentage (0-100) of neurons to ablate
             rf_dim: which RF dimension to use for importance ('rf_0', 'rf_1', etc.)
@@ -359,7 +413,7 @@ class ActivationMonitor:
         # Return (layer_name, neuron_index) pairs
         return [(layer_name, neuron_idx) for layer_name, neuron_idx, _ in selected]
 
-    def _mask_neurons(self, model: nn.Module, neuron_selection: List[Tuple[str, int]]) -> nn.Module:
+    def _mask_neurons(self, model: Any, neuron_selection: List[Tuple[str, int]]) -> Any:
         """
         Create a copy of the model with selected neurons masked (set to 0)
         """
@@ -378,23 +432,53 @@ class ActivationMonitor:
             # Find the corresponding module in the model
             module = self._get_module_by_name(ablated_model, layer_name)
             
-            if isinstance(module, nn.Linear):
-                # Mask weights and biases
+            if hasattr(module, 'weight'):
+                # Mask weights and biases for linear layers
                 for neuron_idx in neuron_indices:
                     # Zero out outgoing weights (this neuron's effect on next layer)
-                    module.weight.data[neuron_idx, :] = 0
-                    if module.bias is not None:
-                        module.bias.data[neuron_idx] = 0
+                    if hasattr(module.weight, 'data'):
+                        module.weight.data[neuron_idx, :] = 0
+                    else:
+                        # For tinygrad tensors, direct assignment
+                        weight_data = module.weight.numpy()
+                        weight_data[neuron_idx, :] = 0
+                        module.weight = Tensor(weight_data)
+                    
+                    if hasattr(module, 'bias') and module.bias is not None:
+                        if hasattr(module.bias, 'data'):
+                            module.bias.data[neuron_idx] = 0
+                        else:
+                            bias_data = module.bias.numpy()
+                            bias_data[neuron_idx] = 0
+                            module.bias = Tensor(bias_data)
             else:
                 print(f"Warning: Cannot mask module type {type(module)} for layer {layer_name}")
         
         return ablated_model
 
-    def _get_module_by_name(self, model: nn.Module, layer_name: str) -> nn.Module:
+    def _get_module_by_name(self, model: Any, layer_name: str) -> Any:
         """
         Get a module from the model by its registered name from hooks
         """
-        for name, module in model.named_modules():
-            if name == layer_name:
-                return module
-        raise ValueError(f"Module {layer_name} not found in model")
+        def find_module(obj, target_name, current_name=""):
+            for attr_name in dir(obj):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    full_name = f"{current_name}.{attr_name}" if current_name else attr_name
+                    if full_name == target_name:
+                        return getattr(obj, attr_name)
+                    
+                    attr = getattr(obj, attr_name)
+                    if hasattr(attr, '__dict__') and not isinstance(attr, (type, Tensor)):
+                        result = find_module(attr, target_name, full_name)
+                        if result is not None:
+                            return result
+                except:
+                    continue
+            return None
+        
+        module = find_module(model, layer_name)
+        if module is None:
+            raise ValueError(f"Module {layer_name} not found in model")
+        return module
