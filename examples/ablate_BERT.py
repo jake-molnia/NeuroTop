@@ -1,181 +1,194 @@
 #%% Setup
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-from tinygrad.tensor import Tensor
-from tinygrad import nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding
+from datasets import load_dataset
 import os
 from tqdm import tqdm
 import time
 
-# Import tinyzoo and ntop (assuming ntop works with tinygrad)
-from tinyzoo.models.bert import BERTForSequenceClassification
-from tinyzoo.data.glue import GLUE
 import ntop
 from ntop.monitoring import ActivationMonitor
+from ntop import analysis, plots
 
-print("BERT Ablation Testing with RF-Guided Pruning (tinygrad + ntop)")
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"BERT Ablation Testing with RF-Guided Pruning (PyTorch + HuggingFace)")
+print(f"Device: {device}")
 
 #%% Data Setup Functions
-def create_simple_vocab(texts, max_vocab=5000):
-    """Create simple vocabulary from texts"""
-    word_freq = {}
-    for text in texts:
-        for word in text.lower().split():
-            word_freq[word] = word_freq.get(word, 0) + 1
+def prepare_dataset(dataset_name='cola', subset_size=1000, max_length=64):
+    """Prepare GLUE dataset with HuggingFace"""
+    print(f"Loading {dataset_name} dataset...")
     
-    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
-    vocab = {'[PAD]': 0, '[CLS]': 1, '[SEP]': 2, '[UNK]': 3}
+    # Load dataset
+    if dataset_name == 'cola':
+        dataset = load_dataset('glue', 'cola')
+        text_column = 'sentence'
+        label_column = 'label'
+    elif dataset_name == 'sst2':
+        dataset = load_dataset('glue', 'sst2')
+        text_column = 'sentence'
+        label_column = 'label'
+    elif dataset_name == 'mrpc':
+        dataset = load_dataset('glue', 'mrpc')
+        text_column = ['sentence1', 'sentence2']
+        label_column = 'label'
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
     
-    for word, _ in sorted_words[:max_vocab-4]:
-        vocab[word] = len(vocab)
+    # Apply subset if specified
+    if subset_size:
+        train_dataset = dataset['train'].select(range(min(subset_size, len(dataset['train']))))
+        validation_dataset = dataset['validation'].select(range(min(subset_size//4, len(dataset['validation']))))
+    else:
+        train_dataset = dataset['train']
+        validation_dataset = dataset['validation']
     
-    return vocab
+    return train_dataset, validation_dataset, text_column, label_column
 
-def tokenize_texts(texts, vocab, max_length=128):
-    """Convert texts to token IDs"""
-    tokenized = []
-    for text in texts:
-        tokens = [vocab['[CLS]']]
-        words = text.lower().split()[:max_length-2]
-        
-        for word in words:
-            tokens.append(vocab.get(word, vocab['[UNK]']))
-        
-        tokens.append(vocab['[SEP]'])
-        
-        while len(tokens) < max_length:
-            tokens.append(vocab['[PAD]'])
-        
-        tokens = tokens[:max_length]
-        tokenized.append(tokens)
-    
-    return tokenized
+def tokenize_function(examples, tokenizer, text_column, max_length=64):
+    """Tokenize texts using HuggingFace tokenizer"""
+    if isinstance(text_column, list):
+        # For sentence pair tasks like MRPC
+        return tokenizer(
+            examples[text_column[0]], 
+            examples[text_column[1]],
+            truncation=True,
+            padding=False,  # We'll pad dynamically in DataLoader
+            max_length=max_length
+        )
+    else:
+        # For single sentence tasks like CoLA
+        return tokenizer(
+            examples[text_column],
+            truncation=True,
+            padding=False,  # We'll pad dynamically in DataLoader
+            max_length=max_length
+        )
 
-class TinygradDataLoader:
-    """Simple DataLoader for tinygrad"""
-    def __init__(self, tokens, labels, batch_size=16, shuffle=False):
-        self.tokens = tokens
-        self.labels = labels
-        self.batch_size = batch_size
-        self.shuffle = shuffle
+def create_data_loaders(train_dataset, val_dataset, tokenizer, text_column, batch_size=16, max_length=64):
+    """Create PyTorch DataLoaders"""
+    # Tokenize datasets
+    tokenized_train = train_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, text_column, max_length),
+        batched=True,
+        remove_columns=train_dataset.column_names
+    )
     
-    def __iter__(self):
-        indices = list(range(len(self.tokens)))
-        if self.shuffle:
-            np.random.shuffle(indices)
-        
-        for i in range(0, len(indices), self.batch_size):
-            batch_indices = indices[i:i+self.batch_size]
-            batch_tokens = [self.tokens[idx] for idx in batch_indices]
-            batch_labels = [self.labels[idx] for idx in batch_indices]
-            
-            input_ids = Tensor(batch_tokens)
-            attention_mask = (input_ids != 0).float()
-            labels_tensor = Tensor([int(label) for label in batch_labels])
-            
-            yield {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels_tensor
-            }
+    tokenized_val = val_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, text_column, max_length),
+        batched=True,
+        remove_columns=val_dataset.column_names
+    )
     
-    def __len__(self):
-        return (len(self.tokens) + self.batch_size - 1) // self.batch_size
+    # Set format for PyTorch
+    tokenized_train.set_format("torch")
+    tokenized_val.set_format("torch")
+    
+    # Create data collator for dynamic padding
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    
+    # Create DataLoaders
+    train_loader = DataLoader(
+        tokenized_train,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=data_collator
+    )
+    
+    val_loader = DataLoader(
+        tokenized_val,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=data_collator
+    )
+    
+    return train_loader, val_loader
 
 def evaluate_model(model, test_loader, description="Evaluation"):
     """Evaluate model accuracy"""
+    model.eval()
     correct = 0
     total = 0
     
-    for batch in tqdm(test_loader, desc=description, unit="batch", leave=False):
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['labels']
-        
-        outputs = model(input_ids, attention_mask=attention_mask)
-        logits = outputs['logits']
-        predictions = logits.argmax(axis=-1)
-        
-        correct += float((predictions == labels).sum().numpy())
-        total += len(labels)
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc=description, unit="batch", leave=False):
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            outputs = model(**batch)
+            logits = outputs.logits
+            predictions = torch.argmax(logits, dim=-1)
+            
+            correct += (predictions == batch['labels']).sum().item()
+            total += batch['labels'].size(0)
     
+    model.train()  # Reset to training mode
     return 100 * correct / total
-
-def get_model_parameters(model):
-    """Extract all trainable parameters from tinygrad model"""
-    params = []
-    
-    def find_tensors(obj):
-        found = []
-        for attr_name in dir(obj):
-            if attr_name.startswith('_'):
-                continue
-            try:
-                attr = getattr(obj, attr_name)
-                if isinstance(attr, Tensor):
-                    found.append(attr)
-                elif hasattr(attr, '__dict__') and not isinstance(attr, type):
-                    found.extend(find_tensors(attr))
-            except:
-                continue
-        return found
-    
-    return find_tensors(model)
 
 #%% Cell 1: Model Setup and Initial Analysis
 print("Setting up BERT model for ablation testing...")
 
-# Load test data
-test_dataset = GLUE(root='./data', task='cola', split='dev')
-test_texts = test_dataset.texts[:800]  # Reasonable subset for testing
-test_labels = test_dataset.labels[:800]
+# Load model and tokenizer
+model_name = 'bert-base-uncased'
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name, 
+    num_labels=2,
+    output_attentions=False,
+    output_hidden_states=False
+).to(device)
 
-# Create vocabulary and tokenize
-vocab = create_simple_vocab(test_texts)
-test_tokens = tokenize_texts(test_texts, vocab, max_length=64)
-test_loader = TinygradDataLoader(test_tokens, test_labels, batch_size=16, shuffle=False)
+# Prepare dataset
+train_dataset, val_dataset, text_column, label_column = prepare_dataset(
+    dataset_name='cola',
+    subset_size=800,  # Reasonable subset for testing
+    max_length=64
+)
 
-print(f"Test dataset: {len(test_texts)} samples in {len(test_loader)} batches")
-print(f"Vocabulary size: {len(vocab)}")
+# Create data loaders
+train_loader, val_loader = create_data_loaders(
+    train_dataset, val_dataset, tokenizer, text_column,
+    batch_size=16, max_length=64
+)
 
-# Initialize model
-model = BERTForSequenceClassification('base', num_labels=2)
+print(f"Train batches: {len(train_loader)}")
+print(f"Validation batches: {len(val_loader)}")
+print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-# Get model parameters for optimizer (needed for training simulation)
-model_params = get_model_parameters(model)
-total_params = sum(param.numel() for param in model_params)
-print(f"Model: BERT-Base ({total_params:,} parameters)")
-
-# Simulate trained model by running a few training steps
+# Quick training simulation to get a reasonable model
 print("Simulating trained model (running brief training simulation)...")
-optimizer = nn.optim.Adam(model_params, lr=1e-4)
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss()
 
-# Run a few training steps to simulate a trained model
-with Tensor.train():
-    for i, batch in enumerate(test_loader):
-        if i >= 5:  # Just a few steps
-            break
-        
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['labels']
-        
-        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs['loss']
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+model.train()
+for i, batch in enumerate(train_loader):
+    if i >= 5:  # Just a few steps
+        break
+    
+    batch = {k: v.to(device) for k, v in batch.items()}
+    
+    optimizer.zero_grad()
+    outputs = model(**batch)
+    loss = outputs.loss
+    
+    loss.backward()
+    optimizer.step()
 
 # Evaluate original model performance
 print("Evaluating original model performance...")
-original_accuracy = evaluate_model(model, test_loader, "Original Model")
+original_accuracy = evaluate_model(model, val_loader, "Original Model")
 print(f"Original Model Accuracy: {original_accuracy:.2f}%")
 
 #%% Cell 2: Topology Analysis and RF Computation
 print("\nSetting up topology monitoring and analyzing BERT structure...")
 
-# Setup monitoring (assuming ntop works with tinygrad)
+# Setup monitoring for HuggingFace BERT
 monitor = ActivationMonitor(model, model_type='transformer')
 monitor.set_config(
     output_file='./outputs/bert_ablation_test.npz',
@@ -196,7 +209,7 @@ monitor.set_config(
 # Analyze the model to get RF values
 print("Computing RF values for all components...")
 state = monitor.analyze(
-    test_loader, 
+    val_loader, 
     epoch=0, 
     description="ABLATION_ANALYSIS"
 )
@@ -213,8 +226,9 @@ if 'by_components' in state:
         rf_data = comp_result['rf_values']
         all_rf_values = []
         for layer_rf in rf_data.values():
-            rf_0_values = np.array(layer_rf['rf_0'])
-            all_rf_values.extend(rf_0_values[rf_0_values > 0])
+            if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
+                rf_0_values = np.array(layer_rf['rf_0'])
+                all_rf_values.extend(rf_0_values[rf_0_values > 0])
         
         median_rf = np.median(all_rf_values) if all_rf_values else 0.0
         print(f"{comp_name.title()}: {total_neurons} neurons, Betti: {betti}, RF median: {median_rf:.4f}")
@@ -243,12 +257,12 @@ for strategy in strategies:
     
     for percentage in percentages:
         try:
-            # Create ablated model using ntop (assuming it works with tinygrad)
+            # Create ablated model using ntop
             ablated_model = monitor.ablate(model, strategy, percentage, rf_dim='rf_0')
             
             # Evaluate ablated model
             ablated_accuracy = evaluate_model(
-                ablated_model, test_loader, 
+                ablated_model, val_loader, 
                 f"{strategy.title()} {percentage}%"
             )
             
@@ -357,10 +371,10 @@ if 'by_components' in state:
         print(f"\nTesting {comp_name} component ablation (50% removal)...")
         
         try:
-            # Test 50% ablation for each component using ntop
-            ablated_model = monitor.ablate(model, 'percent', 50, rf_dim='rf_0', 
-                                         state={'by_components': {comp_name: comp_result}})
-            component_accuracy = evaluate_model(ablated_model, test_loader, f"{comp_name} 50%")
+            # Test 50% ablation for each component
+            component_state = {'by_components': {comp_name: comp_result}}
+            ablated_model = monitor.ablate(model, 'percent', 50, rf_dim='rf_0', state=component_state)
+            component_accuracy = evaluate_model(ablated_model, val_loader, f"{comp_name} 50%")
             
             component_ablation_results[comp_name] = {
                 'accuracy': component_accuracy,
@@ -452,7 +466,7 @@ ax.grid(True, alpha=0.3)
 
 # 4. Component Ablation Results
 ax = axes[1, 1]
-if component_ablation_results:
+if 'component_ablation_results' in locals() and component_ablation_results:
     comp_names = list(component_ablation_results.keys())
     comp_drops = [component_ablation_results[comp]['drop'] for comp in comp_names]
     
@@ -519,7 +533,8 @@ with open(results_file, 'w') as f:
     f.write("BERT Ablation Test Results - Comprehensive Analysis\n")
     f.write("="*60 + "\n")
     f.write(f"Original Model Accuracy: {original_accuracy:.2f}%\n")
-    f.write(f"Test Dataset Size: {len(test_texts)} samples\n")
+    f.write(f"Model: {model_name}\n")
+    f.write(f"Dataset: CoLA\n")
     f.write(f"Total Tests Performed: {total_tests}\n")
     f.write(f"Average RF-guided Advantage: {avg_advantage:+.2f}%\n\n")
     
@@ -535,29 +550,13 @@ with open(results_file, 'w') as f:
             
             f.write(f"{percentage}\t{rf_acc:.2f}\t{rf_drop:.2f}\t{random_acc:.2f}\t{random_drop:.2f}\t{advantage:+.2f}\n")
     
-    if component_ablation_results:
+    if 'component_ablation_results' in locals() and component_ablation_results:
         f.write("\nComponent Ablation Results (50%):\n")
         f.write("Component\tAccuracy\tDrop\tNeurons\n")
         for comp_name, comp_data in component_ablation_results.items():
             f.write(f"{comp_name}\t{comp_data['accuracy']:.2f}\t{comp_data['drop']:.2f}\t{comp_data['neurons']}\n")
 
 print(f"Detailed results saved to: {results_file}")
-
-# Final summary with key findings
-print(f"\nFinal BERT Ablation Summary:")
-print(f"="*50)
-print(f"✓ Tested {len(strategies)} ablation strategies")
-print(f"✓ Tested {len(percentages)} pruning percentages (5-100%)")
-print(f"✓ Total model evaluations: {total_tests}")
-print(f"✓ Average RF-guided advantage: {avg_advantage:+.2f}% accuracy")
-print(f"✓ Best pruning threshold (80% performance): RF={max_prunable_rf}%, Random={max_prunable_random}%")
-
-if component_ablation_results:
-    print(f"✓ Component analysis: {len(component_ablation_results)} components tested")
-    most_critical = max(component_ablation_results.items(), key=lambda x: x[1]['drop'])
-    print(f"✓ Most critical component: {most_critical[0]} ({most_critical[1]['drop']:.1f}% performance drop)")
-
-print(f"✓ Results and visualizations saved to: {output_dir}")
 
 # Cleanup
 monitor.remove_hooks()

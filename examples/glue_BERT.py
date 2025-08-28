@@ -1,237 +1,261 @@
 #%% Setup
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
-from tinygrad.tensor import Tensor
-from tinygrad import nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding
+from datasets import load_dataset
 import os
 from tqdm import tqdm
 import time
 
-# Import tinyzoo and ntop (assuming ntop will be modified to work with tinygrad)
-from tinyzoo.models.bert import BERTForSequenceClassification
-from tinyzoo.data.glue import GLUE
 import ntop
 from ntop.monitoring import ActivationMonitor
 from ntop import analysis, plots
 
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"BERT Training Analysis with Topology Monitoring (PyTorch + HuggingFace)")
+print(f"Device: {device}")
+
 #%% Data Preparation Functions
-def create_simple_vocab(texts, max_vocab=5000):
-    """Create simple vocabulary from texts"""
-    word_freq = {}
-    for text in texts:
-        for word in text.lower().split():
-            word_freq[word] = word_freq.get(word, 0) + 1
-    
-    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
-    vocab = {'[PAD]': 0, '[CLS]': 1, '[SEP]': 2, '[UNK]': 3}
-    
-    for word, _ in sorted_words[:max_vocab-4]:
-        vocab[word] = len(vocab)
-    
-    return vocab
-
-def tokenize_texts(texts, vocab, max_length=128):
-    """Convert texts to token IDs"""
-    tokenized = []
-    for text in texts:
-        tokens = [vocab['[CLS]']]
-        words = text.lower().split()[:max_length-2]
-        
-        for word in words:
-            tokens.append(vocab.get(word, vocab['[UNK]']))
-        
-        tokens.append(vocab['[SEP]'])
-        
-        while len(tokens) < max_length:
-            tokens.append(vocab['[PAD]'])
-        
-        tokens = tokens[:max_length]
-        tokenized.append(tokens)
-    
-    return tokenized
-
-class TinygradDataLoader:
-    """Simple DataLoader for tinygrad"""
-    def __init__(self, tokens, labels, batch_size=16, shuffle=True):
-        self.tokens = tokens
-        self.labels = labels
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-    
-    def __iter__(self):
-        indices = list(range(len(self.tokens)))
-        if self.shuffle:
-            np.random.shuffle(indices)
-        
-        for i in range(0, len(indices), self.batch_size):
-            batch_indices = indices[i:i+self.batch_size]
-            batch_tokens = [self.tokens[idx] for idx in batch_indices]
-            batch_labels = [self.labels[idx] for idx in batch_indices]
-            
-            input_ids = Tensor(batch_tokens)
-            attention_mask = (input_ids != 0).float()
-            labels_tensor = Tensor([int(label) for label in batch_labels])
-            
-            yield {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels_tensor
-            }
-    
-    def __len__(self):
-        return (len(self.tokens) + self.batch_size - 1) // self.batch_size
-
-#%% Model and Data Setup
-def setup_bert_experiment(task='cola', subset_size=2000, max_length=128, batch_size=16):
-    """Setup BERT model and data for tinygrad"""
+def prepare_dataset(task='cola', subset_size=2000, max_length=128):
+    """Prepare GLUE dataset with HuggingFace"""
     print(f"Setting up BERT experiment for {task}...")
     
-    # Load datasets
-    train_dataset = GLUE(root='./data', task=task, split='train')
-    dev_dataset = GLUE(root='./data', task=task, split='dev')
+    # Load dataset with debug info
+    try:
+        print(f"Attempting to download/load GLUE dataset for task: {task}")
+        if task == 'cola':
+            dataset = load_dataset('glue', 'cola')
+            text_column = 'sentence'
+            label_column = 'label'
+            num_labels = 2
+        elif task == 'sst2':
+            dataset = load_dataset('glue', 'sst2')
+            text_column = 'sentence'
+            label_column = 'label'
+            num_labels = 2
+        elif task == 'mrpc':
+            dataset = load_dataset('glue', 'mrpc')
+            text_column = ['sentence1', 'sentence2']
+            label_column = 'label'
+            num_labels = 2
+        elif task == 'qnli':
+            dataset = load_dataset('glue', 'qnli')
+            text_column = ['question', 'sentence']
+            label_column = 'label'
+            num_labels = 2
+        else:
+            raise ValueError(f"Unsupported task: {task}")
+        print(f"Dataset loaded: {dataset}")
+    except Exception as e:
+        print(f"Failed to load GLUE dataset for task {task}: {e}")
+        raise
     
     # Apply subset for faster experimentation
     if subset_size:
-        train_texts = train_dataset.texts[:subset_size]
-        train_labels = train_dataset.labels[:subset_size]
-        dev_texts = dev_dataset.texts[:subset_size//4]
-        dev_labels = dev_dataset.labels[:subset_size//4]
+        train_dataset = dataset['train'].select(range(min(subset_size, len(dataset['train']))))
+        dev_dataset = dataset['validation'].select(range(min(subset_size//4, len(dataset['validation']))))
     else:
-        train_texts = train_dataset.texts
-        train_labels = train_dataset.labels
-        dev_texts = dev_dataset.texts
-        dev_labels = dev_dataset.labels
+        train_dataset = dataset['train']
+        dev_dataset = dataset['validation']
     
-    # Create vocabulary
-    all_texts = train_texts + dev_texts
-    vocab = create_simple_vocab(all_texts)
-    print(f"Vocabulary size: {len(vocab)}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(dev_dataset)}")
     
-    # Tokenize
-    train_tokens = tokenize_texts(train_texts, vocab, max_length)
-    dev_tokens = tokenize_texts(dev_texts, vocab, max_length)
-    
-    # Create data loaders
-    train_loader = TinygradDataLoader(train_tokens, train_labels, batch_size, shuffle=True)
-    dev_loader = TinygradDataLoader(dev_tokens, dev_labels, batch_size, shuffle=False)
-    
-    # Initialize BERT model
-    model = BERTForSequenceClassification('base', num_labels=2)
-    
-    print(f"Model created: BERT-Base")
-    print(f"Training batches: {len(train_loader)}")
-    print(f"Dev batches: {len(dev_loader)}")
-    
-    return model, train_loader, dev_loader, vocab
+    return train_dataset, dev_dataset, text_column, label_column, num_labels
 
-def get_model_parameters(model):
-    """Extract all trainable parameters from tinygrad model"""
-    params = []
+def tokenize_function(examples, tokenizer, text_column, max_length=128):
+    """Tokenize texts using HuggingFace tokenizer"""
+    if isinstance(text_column, list):
+        # For sentence pair tasks
+        return tokenizer(
+            examples[text_column[0]], 
+            examples[text_column[1]],
+            truncation=True,
+            padding=False,  # Dynamic padding
+            max_length=max_length
+        )
+    else:
+        # For single sentence tasks
+        return tokenizer(
+            examples[text_column],
+            truncation=True,
+            padding=False,  # Dynamic padding
+            max_length=max_length
+        )
+
+def create_data_loaders(train_dataset, dev_dataset, tokenizer, text_column, batch_size=16, max_length=128):
+    """Create PyTorch DataLoaders with proper tokenization"""
     
-    def find_tensors(obj, prefix=""):
-        found = []
-        for attr_name in dir(obj):
-            if attr_name.startswith('_'):
-                continue
-            try:
-                attr = getattr(obj, attr_name)
-                if isinstance(attr, Tensor):
-                    found.append(attr)
-                elif hasattr(attr, '__dict__') and not isinstance(attr, type):
-                    found.extend(find_tensors(attr, f"{prefix}.{attr_name}" if prefix else attr_name))
-            except:
-                continue
-        return found
+    # Tokenize datasets
+    # Determine which columns to remove (the original text columns)
+    if isinstance(text_column, list):
+        remove_columns = text_column.copy()
+    else:
+        remove_columns = [text_column]
+
+    # Also remove 'idx' if present (common in GLUE)
+    for col in ['idx']:
+        if col in train_dataset.column_names:
+            remove_columns.append(col)
+
+
+    # Tokenize and remove only text columns
+    tokenized_train = train_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, text_column, max_length),
+        batched=True,
+        remove_columns=remove_columns
+    )
+    tokenized_dev = dev_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, text_column, max_length),
+        batched=True,
+        remove_columns=remove_columns
+    )
+
+    # Ensure label column is named 'labels' for HuggingFace models
+    def rename_label_column(dataset):
+        if 'label' in dataset.column_names and 'labels' not in dataset.column_names:
+            return dataset.rename_column('label', 'labels')
+        return dataset
+
+    tokenized_train = rename_label_column(tokenized_train)
+    tokenized_dev = rename_label_column(tokenized_dev)
     
-    return find_tensors(model)
+    # Set format for PyTorch, keep only required columns
+    tokenized_train.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    tokenized_dev.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    
+    # Create data collator for dynamic padding
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    
+    # Create DataLoaders
+    train_loader = DataLoader(
+        tokenized_train,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=data_collator
+    )
+    
+    dev_loader = DataLoader(
+        tokenized_dev,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=data_collator
+    )
+    
+    return train_loader, dev_loader
 
 #%% Training Functions
 def train_epoch(model, train_loader, optimizer, epoch_desc="Training"):
-    """Train one epoch using tinygrad"""
+    """Train one epoch using PyTorch"""
+    model.train()
     total_loss = 0.0
     correct = 0
     total = 0
     
     pbar = tqdm(train_loader, desc=epoch_desc)
     
-    with Tensor.train():  # Set training mode
-        for batch in pbar:
-            input_ids = batch['input_ids']
-            attention_mask = batch['attention_mask']
-            labels = batch['labels']
-            
-            # Forward pass
-            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs['loss']
-            logits = outputs['logits']
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # Statistics
-            total_loss += float(loss.numpy())
-            predictions = logits.argmax(axis=-1)
-            batch_correct = float((predictions == labels).sum().numpy())
-            correct += batch_correct
-            total += len(labels)
-            
-            # Update progress bar
-            accuracy = 100 * correct / total
-            pbar.set_postfix({
-                'Loss': f'{float(loss.numpy()):.4f}',
-                'Acc': f'{accuracy:.2f}%'
-            })
+    for batch in pbar:
+        # Move batch to device
+        batch = {k: v.to(device) for k, v in batch.items()}
+        
+        # Forward pass
+        optimizer.zero_grad()
+        outputs = model(**batch)
+        loss = outputs.loss
+        logits = outputs.logits
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Statistics
+        total_loss += loss.item()
+        predictions = torch.argmax(logits, dim=-1)
+        batch_correct = (predictions == batch['labels']).sum().item()
+        correct += batch_correct
+        total += batch['labels'].size(0)
+        
+        # Update progress bar
+        accuracy = 100 * correct / total
+        pbar.set_postfix({
+            'Loss': f'{loss.item():.4f}',
+            'Acc': f'{accuracy:.2f}%'
+        })
     
     return total_loss / len(train_loader), 100 * correct / total
 
 def evaluate(model, dev_loader, desc="Validation"):
     """Evaluate model"""
+    model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
     
-    # No training mode in tinygrad eval
-    for batch in tqdm(dev_loader, desc=desc):
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        labels = batch['labels']
-        
-        # Forward pass (no gradients)
-        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
-        loss = outputs['loss']
-        logits = outputs['logits']
-        
-        # Statistics
-        total_loss += float(loss.numpy())
-        predictions = logits.argmax(axis=-1)
-        correct += float((predictions == labels).sum().numpy())
-        total += len(labels)
+    with torch.no_grad():
+        for batch in tqdm(dev_loader, desc=desc):
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Forward pass
+            outputs = model(**batch)
+            loss = outputs.loss
+            logits = outputs.logits
+            
+            # Statistics
+            total_loss += loss.item()
+            predictions = torch.argmax(logits, dim=-1)
+            correct += (predictions == batch['labels']).sum().item()
+            total += batch['labels'].size(0)
     
     return total_loss / len(dev_loader), 100 * correct / total
 
 #%% Initialize Experiment
 print("Initializing BERT experiment...")
-model, train_loader, dev_loader, vocab = setup_bert_experiment(
-    task='cola', 
-    subset_size=1000,
-    max_length=64,
-    batch_size=16
+
+# Setup experiment parameters
+task = 'cola'
+subset_size = 1000
+max_length = 64
+batch_size = 16
+
+# Load model and tokenizer
+model_name = 'bert-base-uncased'
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Prepare dataset
+train_dataset, dev_dataset, text_column, label_column, num_labels = prepare_dataset(
+    task=task,
+    subset_size=subset_size,
+    max_length=max_length
 )
 
-# Extract parameters for optimizer
-model_params = get_model_parameters(model)
-print(f"Found {len(model_params)} model parameters")
+# Create model
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=num_labels,
+    output_attentions=False,
+    output_hidden_states=False
+).to(device)
+
+# Create data loaders
+train_loader, dev_loader = create_data_loaders(
+    train_dataset, dev_dataset, tokenizer, text_column,
+    batch_size=batch_size, max_length=max_length
+)
+
+print(f"Train batches: {len(train_loader)}")
+print(f"Dev batches: {len(dev_loader)}")
+print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 # Initialize optimizer
-optimizer = nn.optim.Adam(model_params, lr=2e-5)
+optimizer = optim.Adam(model.parameters(), lr=2e-5)
 
-# Total parameters count
-total_params = sum(param.numel() for param in model_params)
-print(f"Total parameters: {total_params:,}")
-
-#%% Configure ntop Monitoring (assumes ntop works with tinygrad)
+#%% Configure ntop Monitoring
 output_folder = './outputs/bert_training_analysis'
 os.makedirs(output_folder, exist_ok=True)
 
@@ -246,7 +270,7 @@ monitor.set_config(
     filter_inactive_neurons=False,
     persistence_threshold=0.01,
     use_quantization=True,
-    quantization_resolution=0.1,
+    quantization_resolution=0.01,
     sequence_strategy='cls',
     analyze_full_network=False,
     analyze_by_layers=False,        
@@ -258,7 +282,7 @@ print("\nAnalyzing initial BERT topology...")
 initial_state = monitor.analyze(dev_loader, epoch=0, description="INITIAL_STATE", save=True)
 
 #%% Training Loop
-print(f"\nStarting BERT training on CoLA task...")
+print(f"\nStarting BERT training on {task.upper()} task...")
 
 epochs = 30
 best_accuracy = 0
@@ -334,8 +358,9 @@ if 'by_components' in final_state:
         rf_data = comp_result['rf_values']
         all_rf_values = []
         for layer_rf in rf_data.values():
-            rf_0_values = np.array(layer_rf['rf_0'])
-            all_rf_values.extend(rf_0_values[rf_0_values > 0])
+            if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
+                rf_0_values = np.array(layer_rf['rf_0'])
+                all_rf_values.extend(rf_0_values[rf_0_values > 0])
         
         total_neurons = comp_result['total_neurons']
         betti = comp_result['betti_numbers']
@@ -349,7 +374,7 @@ print("Generating BERT training analysis plots...")
 
 fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-# Training curves
+# 1. Training curves
 ax = axes[0, 0]
 epochs_range = range(len(train_losses))
 ax.plot(epochs_range, train_losses, 'b-', label='Training Loss', linewidth=2)
@@ -359,7 +384,7 @@ ax.set_title('Training Loss Evolution')
 ax.legend()
 ax.grid(True, alpha=0.3)
 
-# Accuracy curves
+# 2. Accuracy curves
 ax = axes[0, 1]
 ax.plot(epochs_range, train_accuracies, 'g-', label='Training Accuracy', linewidth=2)
 ax.plot(epochs_range, dev_accuracies, 'r-', label='Validation Accuracy', linewidth=2)
@@ -369,7 +394,7 @@ ax.set_title('Accuracy Evolution')
 ax.legend()
 ax.grid(True, alpha=0.3)
 
-# Component importance comparison
+# 3. Component importance comparison
 ax = axes[1, 0]
 if 'by_components' in final_state:
     component_results = final_state['by_components']
@@ -380,8 +405,9 @@ if 'by_components' in final_state:
         rf_data = component_results[comp_name]['rf_values']
         all_rf_values = []
         for layer_rf in rf_data.values():
-            rf_0_values = np.array(layer_rf['rf_0'])
-            all_rf_values.extend(rf_0_values[rf_0_values > 0])
+            if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
+                rf_0_values = np.array(layer_rf['rf_0'])
+                all_rf_values.extend(rf_0_values[rf_0_values > 0])
         medians.append(np.median(all_rf_values) if all_rf_values else 0.0)
     
     bars = ax.bar(comp_names, medians, alpha=0.8)
@@ -393,7 +419,7 @@ if 'by_components' in final_state:
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001, 
                 f'{val:.3f}', ha='center', va='bottom')
 
-# Topology evolution during training
+# 4. Topology evolution during training
 ax = axes[1, 1]
 if topology_evolution:
     epochs_tracked = [ep for ep, _, _ in topology_evolution]
@@ -405,10 +431,19 @@ if topology_evolution:
     
     for _, state, _ in topology_evolution:
         if 'by_components' in state:
-            # Use first component for demo
-            first_comp = list(state['by_components'].values())[0]
-            betti_0_vals.append(first_comp['betti_numbers'].get(0, 0))
-            betti_1_vals.append(first_comp['betti_numbers'].get(1, 0))
+            # Use attention component for demo (most stable)
+            attention_comp = None
+            for comp_name, comp_data in state['by_components'].items():
+                if 'attention' in comp_name.lower():
+                    attention_comp = comp_data
+                    break
+            
+            if attention_comp is None:
+                # Fallback to first component
+                attention_comp = list(state['by_components'].values())[0]
+            
+            betti_0_vals.append(attention_comp['betti_numbers'].get(0, 0))
+            betti_1_vals.append(attention_comp['betti_numbers'].get(1, 0))
         else:
             betti_0_vals.append(0)
             betti_1_vals.append(0)
@@ -487,22 +522,41 @@ if 'by_components' in final_state:
         rf_data = comp_result['rf_values']
         all_rf_values = []
         for layer_rf in rf_data.values():
-            rf_0_values = np.array(layer_rf['rf_0'])
-            all_rf_values.extend(rf_0_values)
+            if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
+                rf_0_values = np.array(layer_rf['rf_0'])
+                all_rf_values.extend(rf_0_values)
         
         if all_rf_values:
             all_rf_values = np.array(all_rf_values)
-            p30 = np.percentile(all_rf_values[all_rf_values > 0], 30)
-            p50 = np.percentile(all_rf_values[all_rf_values > 0], 50)
-            prunable_30 = sum(1 for val in all_rf_values if val <= p30)
-            prunable_50 = sum(1 for val in all_rf_values if val <= p50)
-            
-            print(f"{comp_name}: 30th percentile prunable: {prunable_30/len(all_rf_values)*100:.1f}%, "
-                  f"50th: {prunable_50/len(all_rf_values)*100:.1f}%")
+            active_values = all_rf_values[all_rf_values > 0]
+            if len(active_values) > 0:
+                p30 = np.percentile(active_values, 30)
+                p50 = np.percentile(active_values, 50)
+                prunable_30 = sum(1 for val in all_rf_values if val <= p30)
+                prunable_50 = sum(1 for val in all_rf_values if val <= p50)
+                
+                print(f"{comp_name}: 30th percentile prunable: {prunable_30/len(all_rf_values)*100:.1f}%, "
+                      f"50th: {prunable_50/len(all_rf_values)*100:.1f}%")
+
+# Save training results
+training_results = {
+    'task': task,
+    'model_name': model_name,
+    'best_accuracy': best_accuracy,
+    'epochs': epochs,
+    'train_losses': train_losses,
+    'train_accuracies': train_accuracies,
+    'dev_accuracies': dev_accuracies,
+    'topology_evolution': topology_evolution
+}
+
+results_file = f'{output_folder}/training_results.npz'
+np.savez_compressed(results_file, **training_results)
+print(f"Training results saved to: {results_file}")
 
 monitor.remove_hooks()
 print(f"\nBERT training analysis complete!")
 print(f"Results saved to: {output_folder}")
-print(f"Final performance: {best_accuracy:.2f}% accuracy on CoLA validation set")
+print(f"Final performance: {best_accuracy:.2f}% accuracy on {task.upper()} validation set")
 
 #%%

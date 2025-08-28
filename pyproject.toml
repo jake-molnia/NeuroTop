@@ -16,7 +16,10 @@ dependencies = [
     "scikit-learn>=1.1.0",
     "ripser>=0.6.0",
     "seaborn>=0.11.0",
-    "tinyzoo @ git+https://github.com/jake-molnia/tinyzoo.git"
+    "transformers>=4.20.0",
+    "datasets>=2.0.0",
+    "accelerate>=0.20.0",
+    "tqdm>=4.64.0"
 ]
 
 [project.optional-dependencies]
