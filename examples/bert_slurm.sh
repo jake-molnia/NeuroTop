@@ -36,7 +36,7 @@ echo "Using output directory: ${OUTPUT_DIR}"
 
 
 # --- Step 1: Train the Model ---
-echo -e "\n--- STEP 1: TRAINING MODEL FOR 5 EPOCHS ---"
+echo -e "\n--- STEP 1: TRAINING MODEL FOR 500 EPOCHS ---"
 uv run examples/bert.py train \
     --dataset-name cola \
     --epochs 500 \
@@ -53,6 +53,15 @@ uv run examples/bert.py ablate \
     --dataset-name cola \
     --strategy iterative \
     --component attention \
+    --step-size 1 \
+    --output-dir "${OUTPUT_DIR}"
+
+uv run examples/bert.py ablate \
+    --model-path "${OUTPUT_DIR}/final_model" \
+    --analysis-path "${OUTPUT_DIR}/topology_evolution.npz" \
+    --dataset-name cola \
+    --strategy iterative \
+    --component feedforward \
     --step-size 1 \
     --output-dir "${OUTPUT_DIR}"
 
