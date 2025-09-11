@@ -16,7 +16,8 @@ dependencies = [
     "scikit-learn>=1.1.0",
     "ripser>=0.6.0",
     "seaborn>=0.11.0",
-    "tinyzoo @ git+https://github.com/jake-molnia/tinyzoo.git"
+    "tinyzoo @ git+https://github.com/jake-molnia/tinyzoo.git",
+    "click>=8.2.1",
 ]
 
 [project.optional-dependencies]
