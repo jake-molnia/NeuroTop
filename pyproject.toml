@@ -20,6 +20,7 @@ dependencies = [
     "click>=8.2.1",
     "tqdm>=4.67.1",
     "transformers>=4.56.1",
+    "datasets>=4.0.0",
 ]
 
 [project.optional-dependencies]
