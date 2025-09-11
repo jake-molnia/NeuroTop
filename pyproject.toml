@@ -19,6 +19,7 @@ dependencies = [
     "tinyzoo @ git+https://github.com/jake-molnia/tinyzoo.git",
     "click>=8.2.1",
     "tqdm>=4.67.1",
+    "transformers>=4.56.1",
 ]
 
 [project.optional-dependencies]
