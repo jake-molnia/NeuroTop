@@ -91,40 +91,54 @@ def get_or_train_model(dataset, model_name, subset_size, models_dir, epochs=50):
     
     return model, tokenizer
 
-def find_optimal_compression(model, val_loader, analysis_state, pruning_method, component=None):
+def find_optimal_compression(model, val_loader, analysis_state, pruning_method, component=None, 
+                           hard_stop_threshold=5.0, acceptable_threshold=2.0):
     baseline_acc = evaluate(model, val_loader, quiet=True)
     print(f"Baseline accuracy: {baseline_acc:.2f}%")
     print(f"Pruning {'whole network' if component is None else f'{component} component'}")
+    print(f"Hard stop at {hard_stop_threshold:.1f}% drop, acceptable threshold: {acceptable_threshold:.1f}%")
     
-    low, high, optimal_comp, optimal_acc = 0.0, 95.0, 0.0, baseline_acc
+    compression = 0.0
+    optimal_comp, optimal_acc = 0.0, baseline_acc
+    prev_acc = baseline_acc
+    prev_drop = 0.0
+    step_size = 1.0
     
     with tqdm(desc="Finding optimal compression") as pbar:
-        while high - low > 0.5:
-            mid = (low + high) / 2
-            pbar.set_description(f"Testing {mid:.1f}% compression")
+        while compression < 95.0:
+            compression += step_size
+            pbar.set_description(f"Testing {compression:.1f}% compression")
             
             with contextlib.redirect_stdout(io.StringIO()):
                 monitor = ActivationMonitor(model, model_type='transformer')
                 ablated_model = monitor.ablate(
                     model, 
                     strategy='random' if pruning_method == 'random' else 'percent', 
-                    value=mid,
+                    value=compression,
                     state=analysis_state,
-                    component_name=component  # None = whole network, "attention"/"feedforward" = specific component
+                    component_name=component
                 )
             
             acc = evaluate(ablated_model, val_loader, quiet=True)
-            drop = baseline_acc - acc
+            total_drop = baseline_acc - acc
+            step_drop = prev_acc - acc
             
-            # Hard stop at 5% drop
-            if drop >= 5.0:
-                high = mid
-            elif drop <= 2.0:  # Within acceptable threshold
-                optimal_comp, optimal_acc = mid, acc
-                low = mid
-            else:
-                high = mid
+            # Hard stop at configurable threshold
+            if total_drop >= hard_stop_threshold:
+                print(f"\nHard stop triggered at {compression:.1f}% compression with {total_drop:.2f}% drop")
+                break
+            
+            # Momentum stop: if degradation accelerates beyond acceptable threshold
+            if step_drop - prev_drop > acceptable_threshold:
+                print(f"\nMomentum stop triggered at {compression:.1f}% compression with step drop {step_drop:.2f}%")
+                break
                 
+            # Update optimal if within acceptable range
+            if total_drop <= acceptable_threshold:
+                optimal_comp, optimal_acc = compression, acc
+            
+            prev_acc = acc
+            prev_drop = step_drop
             monitor.remove_hooks()
             pbar.update(1)
     
@@ -140,8 +154,10 @@ def find_optimal_compression(model, val_loader, analysis_state, pruning_method, 
 @click.option('--epochs', default=50)
 @click.option('--component', default=None, help='Component to prune (attention/feedforward), None for whole network')
 @click.option('--subset-size', default=5000)
+@click.option('--hard-stop-threshold', default=5.0, help='Hard stop threshold for performance drop (%)')
+@click.option('--acceptable-threshold', default=2.0, help='Acceptable performance drop threshold (%)')
 def run_experiment(dataset, model_name, pruning_method, distance_metric, results_csv, 
-                  models_dir, epochs, component, subset_size):
+                  models_dir, epochs, component, subset_size, hard_stop_threshold, acceptable_threshold):
     """Run GLUE experiment with RF-based or random pruning."""
     print(f"Experiment: {model_name} on {dataset} with {pruning_method} pruning")
     
@@ -149,22 +165,27 @@ def run_experiment(dataset, model_name, pruning_method, distance_metric, results
     model, tokenizer = get_or_train_model(dataset, model_name, subset_size, models_dir, epochs)
     _, val_loader = prepare_dataset(dataset, subset_size, tokenizer)
     
-    # Analyze if RF-based
-    analysis_state = None
+    # Always analyze topology (needed even for random pruning to identify neurons)
     if pruning_method == 'rf':
-        print("Analyzing topology...")
-        monitor = ActivationMonitor(model, model_type='transformer')
-        analysis_state = monitor.analyze(val_loader, epoch=0, save=False,
-                                       distance_metric=distance_metric, max_dim=1, 
-                                       analyze_by_components=True)
-        monitor.remove_hooks()
+        print(f"Analyzing topology with {distance_metric} distance metric...")
+    else:
+        print("Analyzing topology (identifying neurons for random pruning)...")
+    
+    monitor = ActivationMonitor(model, model_type='transformer')
+    analysis_state = monitor.analyze(val_loader, epoch=0, save=False,
+                                   distance_metric=distance_metric, max_dim=1, 
+                                   analyze_by_components=True)
+    monitor.remove_hooks()
     
     # Find optimal compression
     baseline_acc, optimal_acc, compression_pct = find_optimal_compression(
-        model, val_loader, analysis_state, pruning_method, component)
+        model, val_loader, analysis_state, pruning_method, component, 
+        hard_stop_threshold, acceptable_threshold)
     
     # Save results
-    os.makedirs(os.path.dirname(results_csv), exist_ok=True)
+    results_dir = os.path.dirname(results_csv)
+    if results_dir:  # Only create directory if there's a path
+        os.makedirs(results_dir, exist_ok=True)
     file_exists = os.path.exists(results_csv)
     
     with open(results_csv, 'a', newline='') as f:
