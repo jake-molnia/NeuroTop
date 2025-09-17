@@ -4,272 +4,190 @@ import torch.optim as optim
 import numpy as np
 import os
 import click
+import csv
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-
-import ntop
+import contextlib, io
 from ntop.monitoring import ActivationMonitor
-from ntop import plots
 
-# Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- Data Preparation ---
-def prepare_dataset(dataset_name, subset_size, tokenizer, batch_size, max_length):
-    """Prepares GLUE dataset and creates DataLoaders."""
-    print(f"Setting up GLUE dataset: {dataset_name}...")
+DATASET_CONFIG = {
+    'cola': 2, 'sst2': 2, 'mrpc': 2, 'qqp': 2, 'stsb': 1, 'rte': 2
+}
+
+def prepare_dataset(dataset_name, subset_size, tokenizer, batch_size=16, max_length=128):
     dataset = load_dataset('glue', dataset_name)
     
-    text_cols = [col for col in ['sentence', 'sentence1', 'sentence2', 'question'] if col in dataset['train'].column_names]
+    text_cols = (['sentence'] if dataset_name in ['cola', 'sst2'] 
+                else ['sentence1', 'sentence2'])
     
     def tokenize_function(examples):
-        return tokenizer(*[examples[col] for col in text_cols], truncation=True, padding=False, max_length=max_length)
+        args = [examples[col] for col in text_cols]
+        return tokenizer(*args, truncation=True, padding=False, max_length=max_length)
 
-    remove_cols = list(dataset['train'].column_names)
-    # Ensure 'label' is not removed if it exists
-    if 'label' in remove_cols:
-        remove_cols.remove('label')
+    tokenized = dataset.map(tokenize_function, batched=True, 
+                           remove_columns=[c for c in dataset['train'].column_names if c != 'label'])
+    tokenized = tokenized.rename_column("label", "labels").with_format("torch")
 
-    tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=remove_cols)
-    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
-    tokenized_datasets.set_format("torch")
-
-    train_data = tokenized_datasets['train'].select(range(min(subset_size, len(tokenized_datasets['train']))))
-    val_data = tokenized_datasets['validation'].select(range(min(subset_size // 4, len(tokenized_datasets['validation']))))
+    train_data = tokenized['train'].select(range(min(subset_size, len(tokenized['train']))))
+    val_split = 'validation' if 'validation' in tokenized else 'test'
+    val_data = tokenized[val_split].select(range(min(subset_size // 4, len(tokenized[val_split]))))
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    train_loader = DataLoader(train_data, batch_size=batch_size, collate_fn=collator, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=batch_size, collate_fn=collator)
-    
-    return train_loader, val_loader
+    return (DataLoader(train_data, batch_size=batch_size, collate_fn=collator, shuffle=True),
+            DataLoader(val_data, batch_size=batch_size, collate_fn=collator))
 
-# --- Training & Evaluation ---
-def train_epoch(model, dataloader, optimizer):
-    model.train()
-    total_loss = 0
-    for batch in tqdm(dataloader, desc="Training Epoch"):
-        optimizer.zero_grad()
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**batch)
-        loss = outputs.loss
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(dataloader)
-
-def evaluate(model, dataloader, disable_progress=False):
-    """Evaluates the model, with an option to disable the tqdm progress bar."""
+def evaluate(model, dataloader, quiet=False):
     model.eval()
     correct = total = 0
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating", disable=disable_progress):
+        for batch in tqdm(dataloader, desc="Evaluating", disable=quiet):
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            logits = outputs.logits
-            labels = batch['labels']
-            predictions = torch.argmax(logits, dim=-1)
-            correct += (predictions == labels).sum().item()
-            total += labels.size(0)
+            predictions = torch.argmax(model(**batch).logits, dim=-1)
+            correct += (predictions == batch['labels']).sum().item()
+            total += batch['labels'].size(0)
     return 100 * correct / total
 
-# --- CLI Setup ---
-@click.group()
-def cli():
-    """Neuro-Topological Analysis CLI for BERT models."""
-    pass
-
-@cli.command()
-@click.option('--model-name', default='bert-base-uncased', help='HuggingFace model name.')
-@click.option('--dataset-name', default='cola', type=click.Choice(['cola', 'sst2', 'mrpc']), help='GLUE dataset name.')
-@click.option('--subset-size', default=1000, help='Number of samples to use for analysis.')
-@click.option('--batch-size', default=16, help='Batch size for data loading.')
-@click.option('--max-length', default=128, help='Max sequence length for tokenizer.')
-@click.option('--output-dir', default='./outputs/bert_analysis', help='Directory to save analysis results.')
-def analyze(model_name, dataset_name, subset_size, batch_size, max_length, output_dir):
-    """Analyze a pre-trained BERT model's topology."""
-    print(f"Analyzing {model_name} on {dataset_name}...")
-    os.makedirs(output_dir, exist_ok=True)
+def get_or_train_model(dataset, model_name, subset_size, models_dir, epochs=50):
+    """Load existing trained model or train new one."""
+    model_path = os.path.join(models_dir, f"{model_name.replace('/', '_')}_{dataset}")
     
-    # Load model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
     
-    # Load data
-    _, val_loader = prepare_dataset(dataset_name, subset_size, tokenizer, batch_size, max_length)
+    if os.path.exists(model_path):
+        print(f"Loading existing trained model from {model_path}")
+        model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
+        return model, tokenizer
     
-    # Setup and run monitor
-    monitor = ActivationMonitor(model, model_type='transformer')
-    analysis_params = {
-        'distance_metric': 'euclidean',
-        'max_dim': 1,
-        'persistence_threshold': 0.01,
-        'analyze_by_components': True
-    }
-    state = monitor.analyze(val_loader, **analysis_params)
+    print(f"Training new model for {model_name} on {dataset}")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=DATASET_CONFIG[dataset]).to(device)
     
-    # Save results
-    results_path = os.path.join(output_dir, 'analysis_state.npz')
-    np.savez_compressed(results_path, state=state)
-    print(f"Analysis state saved to {results_path}")
-
-    # Generate plots for each component
-    if 'by_components' in state:
-        for comp_name, comp_result in state['by_components'].items():
-            # **FIX:** Use a simple histogram for single-state analysis
-            plt.figure(figsize=(10, 6))
-            all_rf_vals = []
-            if 'rf_values' in comp_result:
-                for layer_rf in comp_result['rf_values'].values():
-                    if 'rf_0' in layer_rf:
-                        all_rf_vals.extend(layer_rf['rf_0'])
-            
-            if all_rf_vals:
-                plt.hist(all_rf_vals, bins=50, alpha=0.7)
-                plt.xlabel('RF_0 Value')
-                plt.ylabel('Neuron Count')
-                plt.title(f'RF_0 Distribution - {comp_name.title()}')
-                plt.grid(True, alpha=0.3)
-                plt.savefig(os.path.join(output_dir, f'rf_dist_{comp_name}.png'))
-                plt.close()
+    train_loader, _ = prepare_dataset(dataset, subset_size, tokenizer)
+    optimizer = optim.AdamW(model.parameters(), lr=2e-5)
     
-    print("Analysis complete.")
-    monitor.remove_hooks()
-
-@cli.command()
-@click.option('--model-name', default='bert-base-uncased', help='HuggingFace model name.')
-@click.option('--dataset-name', default='cola', type=click.Choice(['cola', 'sst2', 'mrpc']), help='GLUE dataset name.')
-@click.option('--epochs', default=5, help='Number of training epochs.') # Increased default for meaningful evolution
-@click.option('--lr', default=2e-5, help='Learning rate.')
-@click.option('--subset-size', default=2000, help='Number of samples for training.')
-@click.option('--batch-size', default=16, help='Batch size for training.')
-@click.option('--max-length', default=128, help='Max sequence length for tokenizer.')
-@click.option('--output-dir', default='./outputs/bert_training_evolution', help='Directory to save model and results.')
-def train(model_name, dataset_name, epochs, lr, subset_size, batch_size, max_length, output_dir):
-    """Train a BERT model and analyze its topology after every epoch."""
-    print(f"Training {model_name} on {dataset_name} with per-epoch analysis...")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2).to(device)
-    
-    # Load data
-    train_loader, val_loader = prepare_dataset(dataset_name, subset_size, tokenizer, batch_size, max_length)
-    
-    # Initialize the monitor before the training loop
-    monitor = ActivationMonitor(model, model_type='transformer')
-    analysis_params = {'distance_metric': 'euclidean', 'max_dim': 1, 'analyze_by_components': True}
-
-    # Analyze initial state (Epoch 0)
-    monitor.analyze(val_loader, epoch=0, save=True, **analysis_params)
-    
-    # Training loop
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
     for epoch in range(epochs):
-        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
-        train_loss = train_epoch(model, train_loader, optimizer)
-        accuracy = evaluate(model, val_loader)
-        print(f"Epoch {epoch+1}: Loss={train_loss:.4f}, Val Accuracy={accuracy:.2f}%")
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Training Epoch {epoch+1}"):
+            optimizer.zero_grad()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss = model(**batch).loss
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
         
-        # Analyze topology at the end of the epoch
-        monitor.analyze(val_loader, epoch=epoch + 1, save=True, **analysis_params)
-        
-    # Save the complete history of topology states
-    results_path = os.path.join(output_dir, 'topology_evolution.npz')
-    monitor.save_states(results_path)
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}: Loss={total_loss/len(train_loader):.4f}")
     
-    # Save final model
-    model_path = os.path.join(output_dir, 'final_model')
+    # Save trained model
+    os.makedirs(model_path, exist_ok=True)
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(model_path)
-    print(f"Final model saved to {model_path}")
+    print(f"Saved trained model to {model_path}")
+    
+    return model, tokenizer
 
-    monitor.remove_hooks()
+def find_optimal_compression(model, val_loader, analysis_state, pruning_method, component=None):
+    baseline_acc = evaluate(model, val_loader, quiet=True)
+    print(f"Baseline accuracy: {baseline_acc:.2f}%")
+    print(f"Pruning {'whole network' if component is None else f'{component} component'}")
     
-@cli.command()
-@click.option('--model-path', required=True, help='Path to the trained model directory.')
-@click.option('--analysis-path', required=True, help='Path to the saved analysis state (.npz file).')
-@click.option('--dataset-name', default='cola', help='GLUE dataset for evaluation.')
-@click.option('--component', default=None, help='Component to ablate (e.g., "attention"). If None, ablates globally.')
-@click.option('--strategy', type=click.Choice(['percent', 'random', 'iterative']), default='percent', help='Ablation strategy.')
-@click.option('--percentage', type=float, default=50.0, help='Percentage for one-shot ablation.')
-@click.option('--step-size', type=float, default=5.0, help='Step size (in percent) for iterative ablation.')
-@click.option('--output-dir', default='./outputs/bert_ablation', help='Directory to save iterative ablation results.')
-def ablate(model_path, analysis_path, dataset_name, component, strategy, percentage, step_size, output_dir):
-    """Ablate a trained BERT model based on a saved analysis state."""
-    print(f"Running ablation on {model_path} with strategy '{strategy}'...")
-    os.makedirs(output_dir, exist_ok=True)
+    low, high, optimal_comp, optimal_acc = 0.0, 95.0, 0.0, baseline_acc
     
-    # Load model, tokenizer, and data
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
-    _, val_loader = prepare_dataset(dataset_name, 1000, tokenizer, 16, 128)
-    
-    # Load analysis state
-    data = np.load(analysis_path, allow_pickle=True)
-    analysis_state = data['topology_states'][-1] if 'topology_states' in data else data['state'].item()
-    
-    if strategy == 'iterative':
-        print(f"Starting iterative ablation with step size {step_size}%...")
-        
-        original_accuracy = evaluate(model, val_loader)
-        print(f"Original Model Accuracy (0% ablated): {original_accuracy:.2f}%")
-        
-        results = [(0, original_accuracy)]
-        
-        ablation_steps = np.arange(step_size, 100.1, step_size)
-        
-        with tqdm(total=len(ablation_steps), desc="Iterative Ablation") as pbar:
-            for current_percentage in ablation_steps:
-                # Suppress the "Registering hooks..." message inside the loop
-                import contextlib, io
-                with contextlib.redirect_stdout(io.StringIO()):
-                    monitor = ActivationMonitor(model, model_type='transformer')
-                    ablated_model = monitor.ablate(
-                        model, strategy='percent', value=current_percentage,
-                        state=analysis_state, component_name=component
-                    )
+    with tqdm(desc="Finding optimal compression") as pbar:
+        while high - low > 0.5:
+            mid = (low + high) / 2
+            pbar.set_description(f"Testing {mid:.1f}% compression")
+            
+            with contextlib.redirect_stdout(io.StringIO()):
+                monitor = ActivationMonitor(model, model_type='transformer')
+                ablated_model = monitor.ablate(
+                    model, 
+                    strategy='random' if pruning_method == 'random' else 'percent', 
+                    value=mid,
+                    state=analysis_state,
+                    component_name=component  # None = whole network, "attention"/"feedforward" = specific component
+                )
+            
+            acc = evaluate(ablated_model, val_loader, quiet=True)
+            drop = baseline_acc - acc
+            
+            # Hard stop at 5% drop
+            if drop >= 5.0:
+                high = mid
+            elif drop <= 2.0:  # Within acceptable threshold
+                optimal_comp, optimal_acc = mid, acc
+                low = mid
+            else:
+                high = mid
                 
-                # Evaluate with the inner progress bar disabled
-                ablated_accuracy = evaluate(ablated_model, val_loader, disable_progress=True)
-                results.append((current_percentage, ablated_accuracy))
-                
-                # Update the main progress bar's description
-                pbar.set_description(f"Ablating {current_percentage:.1f}% | Accuracy: {ablated_accuracy:.2f}%")
-                pbar.update(1)
-        
-        # --- Plotting and reporting results ---
-        percentages, accuracies = zip(*results)
-        plt.figure(figsize=(12, 7))
-        plt.plot(percentages, accuracies, 'o-', color='royalblue', label='Model Accuracy')
-        plt.title(f'Iterative Ablation Performance ({component or "Global"})')
-        plt.xlabel('Percentage of Neurons Ablated')
-        plt.ylabel('Validation Accuracy (%)')
-        plt.xticks(np.arange(0, 101, 10))
-        plt.grid(True, linestyle='--', alpha=0.6)
-        plt.legend()
-        
-        plot_path = os.path.join(output_dir, f'iterative_ablation_{component or "global"}.png')
-        plt.savefig(plot_path)
-        print(f"\nSaved ablation performance plot to {plot_path}")
+            monitor.remove_hooks()
+            pbar.update(1)
+    
+    return baseline_acc, optimal_acc, optimal_comp
 
-    else: # Handle one-shot 'percent' or 'random' ablation
-        original_accuracy = evaluate(model, val_loader)
-        print(f"Original Model Accuracy: {original_accuracy:.2f}%")
-        
+@click.command()
+@click.option('--dataset', required=True, type=click.Choice(list(DATASET_CONFIG.keys())))
+@click.option('--model-name', required=True, type=click.Choice(['bert-base-uncased', 'bert-large-uncased']))
+@click.option('--pruning-method', required=True, type=click.Choice(['random', 'rf']))
+@click.option('--distance-metric', default='euclidean', type=click.Choice(['euclidean', 'manhattan', 'cosine']))
+@click.option('--results-csv', required=True)
+@click.option('--models-dir', default='./trained_models', help='Directory to cache trained models')
+@click.option('--epochs', default=50)
+@click.option('--component', default=None, help='Component to prune (attention/feedforward), None for whole network')
+@click.option('--subset-size', default=5000)
+def run_experiment(dataset, model_name, pruning_method, distance_metric, results_csv, 
+                  models_dir, epochs, component, subset_size):
+    """Run GLUE experiment with RF-based or random pruning."""
+    print(f"Experiment: {model_name} on {dataset} with {pruning_method} pruning")
+    
+    # Get or train model (cached)
+    model, tokenizer = get_or_train_model(dataset, model_name, subset_size, models_dir, epochs)
+    _, val_loader = prepare_dataset(dataset, subset_size, tokenizer)
+    
+    # Analyze if RF-based
+    analysis_state = None
+    if pruning_method == 'rf':
+        print("Analyzing topology...")
         monitor = ActivationMonitor(model, model_type='transformer')
-        ablated_model = monitor.ablate(
-            model, strategy=strategy, value=percentage,
-            state=analysis_state, component_name=component
-        )
-        
-        ablated_accuracy = evaluate(ablated_model, val_loader)
-        print(f"Ablated Model Accuracy ({percentage}% {strategy} on {component or 'global'}): {ablated_accuracy:.2f}%")
-        print(f"Accuracy Drop: {original_accuracy - ablated_accuracy:.2f}%")
+        analysis_state = monitor.analyze(val_loader, epoch=0, save=False,
+                                       distance_metric=distance_metric, max_dim=1, 
+                                       analyze_by_components=True)
         monitor.remove_hooks()
+    
+    # Find optimal compression
+    baseline_acc, optimal_acc, compression_pct = find_optimal_compression(
+        model, val_loader, analysis_state, pruning_method, component)
+    
+    # Save results
+    os.makedirs(os.path.dirname(results_csv), exist_ok=True)
+    file_exists = os.path.exists(results_csv)
+    
+    with open(results_csv, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['Model', 'Pruning Method', 'Baseline Acc', 
+                                              'Optimal Acc', 'Delta Perf', 'Compression %'])
+        if not file_exists:
+            writer.writeheader()
+        
+        pruning_label = f"RF ({distance_metric.title()})" if pruning_method == 'rf' else "Random"
+        if component:
+            pruning_label += f" ({component})"
+        
+        writer.writerow({
+            'Model': 'BERT-large' if 'large' in model_name else 'BERT-base',
+            'Pruning Method': pruning_label,
+            'Baseline Acc': f"{baseline_acc:.2f}",
+            'Optimal Acc': f"{optimal_acc:.2f}",
+            'Delta Perf': f"{baseline_acc - optimal_acc:.2f}",
+            'Compression %': f"{compression_pct:.1f}"
+        })
+    
+    print(f"\nResults: {baseline_acc:.2f}% → {optimal_acc:.2f}% ({compression_pct:.1f}% compressed)")
+    print(f"Saved to {results_csv}")
 
 if __name__ == '__main__':
-    cli()
+    run_experiment()
