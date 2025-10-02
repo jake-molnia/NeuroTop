@@ -244,21 +244,43 @@ class ActivationMonitor:
         return ablated_model
 
     def _detect_components(self, activations: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Groups layers into logical components like 'attention' or 'feedforward'."""
-        components = {'attention': {}, 'feedforward': {}, 'embeddings': {}, 'pooler': {}, 'classifier': {}}
+        """Detects components in a hierarchical, network-agnostic way."""
+        components = {}
+        
         for name, acts in activations.items():
-            name_lower = name.lower()
-            if 'attention' in name_lower:
-                components['attention'][name] = acts
-            elif 'intermediate' in name_lower or ('output' in name_lower and 'attention' not in name_lower):
-                components['feedforward'][name] = acts
-            elif 'embeddings' in name_lower:
-                components['embeddings'][name] = acts
-            elif 'pooler' in name_lower:
-                components['pooler'][name] = acts
-            elif 'classifier' in name_lower:
-                components['classifier'][name] = acts
-        return {k: v for k, v in components.items() if v}
+            # Parse the component hierarchy from layer names
+            component_path = self._parse_component_path(name)
+            
+            # Create nested structure: e.g., 'attention.query', 'mlp.intermediate'
+            if component_path not in components:
+                components[component_path] = {}
+            components[component_path][name] = acts
+        
+        return components
+
+    def _parse_component_path(self, layer_name: str) -> str:
+        """Extract semantic component name from layer."""
+        name_lower = layer_name.lower()
+        
+        # Attention subcomponents
+        if 'query' in name_lower or '.q.' in name_lower:
+            return 'attention.query'
+        elif 'key' in name_lower or '.k.' in name_lower:
+            return 'attention.key'
+        elif 'value' in name_lower or '.v.' in name_lower:
+            return 'attention.value'
+        elif 'attention.output.dense' in name_lower:
+            return 'attention.output'
+        
+        # MLP subcomponents
+        elif 'intermediate' in name_lower:
+            return 'mlp.intermediate'
+        elif 'output.dense' in name_lower and 'attention' not in name_lower:
+            return 'mlp.output'
+        
+        # Fallback for unknown layers
+        else:
+            return 'other'
 
     def remove_hooks(self):
         """Removes all registered hooks."""
