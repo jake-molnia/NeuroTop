@@ -315,23 +315,46 @@ def run_experiment(dataset, model_name, pruning_method, distance_metric, results
             print(f"  Epoch {epoch+1}: Val Acc={val_acc:.2f}%")
     
     final_acc = evaluate(pruned_model, val_loader, quiet=True)
+
+    def count_parameters(model):
+        """Count total and non-zero parameters."""
+        total = sum(p.numel() for p in model.parameters())
+        nonzero = sum((p != 0).sum().item() for p in model.parameters())
+        return total, nonzero
+
+    # After pruning all components
+    original_total, _ = count_parameters(model)
+    pruned_total, pruned_nonzero = count_parameters(pruned_model)
+
+    compression_ratio = (pruned_nonzero / original_total) * 100
+    params_removed = original_total - pruned_nonzero
+
+    print(f"\nParameter Statistics:")
+    print(f"Original: {original_total:,} parameters")
+    print(f"After pruning: {pruned_nonzero:,} parameters")
+    print(f"Removed: {params_removed:,} ({100 - compression_ratio:.1f}%)")
+    print(f"Retained: {compression_ratio:.1f}% of original")
+
     
     # Save results
     os.makedirs(os.path.dirname(results_csv), exist_ok=True)
     with open(results_csv, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['Model', 'Method', 'Baseline', 
-                                               'After Pruning', 'After FT', 'Delta'])
+                                               'After Pruning', 'After FT', 'Delta', 'Params Retained', 'Params Removed'])
         if not os.path.exists(results_csv) or os.path.getsize(results_csv) == 0:
             writer.writeheader()
         
         writer.writerow({
             'Model': model_name.split('-')[1].title(),
-            'Method': f"{pruning_method} ({'comp' if component_wise else 'full'})",
+            'Method': f"{pruning_method}",
             'Baseline': f"{baseline_acc:.2f}",
             'After Pruning': f"{before_ft:.2f}",
             'After FT': f"{final_acc:.2f}",
-            'Delta': f"{baseline_acc - final_acc:.2f}"
+            'Delta': f"{baseline_acc - final_acc:.2f}",
+            'Params Retained': f"{compression_ratio:.1f}%",
+            'Params Removed': f"{params_removed:,}"
         })
+
     
     print(f"\n{'='*60}")
     print("RESULTS")

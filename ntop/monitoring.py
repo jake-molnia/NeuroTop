@@ -198,50 +198,182 @@ class ActivationMonitor:
         return self._mask_neurons(model, neuron_selection)
 
     def _select_neurons_to_ablate(self, rf_values: Dict[str, Dict[str, np.ndarray]], 
-                                strategy: str, percentage: float, rf_dim: str) -> List[Tuple[str, int]]:
-        """Selects neurons to ablate based on the chosen strategy."""
+                                strategy: str, percentage: float, rf_dim: str,
+                                balance_threshold: float = 1.5) -> List[Tuple[str, int]]:
+        """
+        Select neurons with dynamic load balancing.
+        
+        balance_threshold: How much a layer can deviate from average.
+                        1.5 means a layer can be pruned 50% more than average before skipping.
+        """
+        
+        if strategy == 'random':
+            return self._random_selection_balanced(rf_values, percentage, rf_dim)
+        
+        # Collect all neurons with their RF scores
         all_neurons = []
+        layer_sizes = {}
+        
         for layer_name, layer_rf in rf_values.items():
-            if rf_dim in layer_rf:
-                for idx, score in enumerate(layer_rf[rf_dim]):
-                    all_neurons.append((layer_name, idx, score))
-        
-        if not all_neurons:
-            return []
+            if rf_dim not in layer_rf:
+                continue
             
-        num_to_select = int(len(all_neurons) * percentage / 100)
-        
-        if strategy == 'percent':
-            all_neurons.sort(key=lambda x: x[2]) # Sort by score (ascending)
-            selected = all_neurons[:num_to_select]
-        elif strategy == 'random':
-            import random
-            selected = random.sample(all_neurons, num_to_select)
-        else:
-            raise ValueError(f"Unknown ablation strategy: {strategy}")
+            layer_sizes[layer_name] = len(layer_rf[rf_dim])
             
-        return [(layer, idx) for layer, idx, _ in selected]
+            for idx, score in enumerate(layer_rf[rf_dim]):
+                all_neurons.append((layer_name, idx, float(score)))
+        
+        # Sort globally by RF (ascending - lowest first)
+        all_neurons.sort(key=lambda x: x[2])
+        
+        # Calculate target
+        total_neurons = len(all_neurons)
+        target_pruned = int(total_neurons * percentage / 100)
+        
+        # Track pruning per layer
+        layer_pruned = {layer: 0 for layer in layer_sizes.keys()}
+        selected = []
+        
+        print(f"\nDynamic load balancing: selecting {target_pruned} neurons from {total_neurons}")
+        
+        # Iterate through neurons in RF order
+        for layer_name, idx, score in all_neurons:
+            if len(selected) >= target_pruned:
+                break
+            
+            # Calculate current pruning ratios
+            current_pruned = len(selected)
+            if current_pruned == 0:
+                # First neuron, just take it
+                selected.append((layer_name, idx))
+                layer_pruned[layer_name] += 1
+                continue
+            
+            # Calculate average pruning ratio across all layers
+            avg_ratio = current_pruned / total_neurons
+            
+            # Calculate this layer's current ratio
+            layer_ratio = layer_pruned[layer_name] / layer_sizes[layer_name]
+            
+            # Check if this layer is over-represented
+            if layer_ratio > avg_ratio * balance_threshold:
+                # Skip this neuron - layer is already pruned too much
+                continue
+            
+            # Prune this neuron
+            selected.append((layer_name, idx))
+            layer_pruned[layer_name] += 1
+        
+        # Print summary
+        print(f"\nPruning distribution:")
+        for layer_name in sorted(layer_sizes.keys()):
+            pruned = layer_pruned[layer_name]
+            total = layer_sizes[layer_name]
+            pct = (pruned / total * 100) if total > 0 else 0
+            print(f"  {layer_name}: {pruned}/{total} ({pct:.1f}%)")
+        
+        return selected
+
+    def _random_selection_balanced(self, rf_values, percentage, rf_dim):
+        """Random selection. NOTE: I am uncertain we need this as random already is uniform"""
+        import random
+        
+        # Collect all neurons
+        all_neurons = []
+        layer_sizes = {}
+        
+        for layer_name, layer_rf in rf_values.items():
+            if rf_dim not in layer_rf:
+                continue
+            
+            layer_sizes[layer_name] = len(layer_rf[rf_dim])
+            for idx in range(len(layer_rf[rf_dim])):
+                all_neurons.append((layer_name, idx))
+        
+        # Shuffle randomly
+        random.shuffle(all_neurons)
+        
+        # Apply same balancing logic
+        total_neurons = len(all_neurons)
+        target_pruned = int(total_neurons * percentage / 100)
+        
+        layer_pruned = {layer: 0 for layer in layer_sizes.keys()}
+        selected = []
+        
+        for layer_name, idx in all_neurons:
+            if len(selected) >= target_pruned:
+                break
+            
+            current_pruned = len(selected)
+            if current_pruned == 0:
+                selected.append((layer_name, idx))
+                layer_pruned[layer_name] += 1
+                continue
+            
+            avg_ratio = current_pruned / total_neurons
+            layer_ratio = layer_pruned[layer_name] / layer_sizes[layer_name]
+            
+            if layer_ratio > avg_ratio * 1.5:
+                continue
+            
+            selected.append((layer_name, idx))
+            layer_pruned[layer_name] += 1
+        
+        return selected
 
     def _mask_neurons(self, model: Any, neuron_selection: List[Tuple[str, int]]) -> Any:
-        """Creates a copy of the model with selected neurons masked."""
+        """Creates a copy of the model with selected neurons masked via hooks."""
         ablated_model = copy.deepcopy(model)
         
+        # Group by layer
         layer_masks = {}
         for layer_name, neuron_idx in neuron_selection:
             layer_masks.setdefault(layer_name, []).append(neuron_idx)
-            
+        
+        # Create mask hooks instead of zeroing weights
+        self.mask_hooks = []
+        
         for layer_name, indices in layer_masks.items():
             try:
                 module = dict(ablated_model.named_modules())[layer_name]
+                
                 if isinstance(module, nn.Linear):
+                    # Zero the weights in addition to masking
                     with torch.no_grad():
                         module.weight.data[indices, :] = 0
                         if module.bias is not None:
                             module.bias.data[indices] = 0
+                    
+                    # Then also apply hook (for gradient blocking during fine-tuning)
+                    mask = torch.ones(module.out_features, device=module.weight.device)
+                    mask[indices] = 0.0
+
+                    
+                    # Register hook that applies mask to output
+                    def create_masking_hook(mask_tensor):
+                        def hook(module, input, output):
+                            # Apply mask: zero out pruned neurons
+                            if output.dim() == 3:  # [batch, seq, features]
+                                return output * mask_tensor.view(1, 1, -1)
+                            elif output.dim() == 2:  # [batch, features]
+                                return output * mask_tensor.view(1, -1)
+                            return output
+                        return hook
+                    
+                    hook_handle = module.register_forward_hook(create_masking_hook(mask))
+                    self.mask_hooks.append(hook_handle)
+                                        
             except KeyError:
-                print(f"Warning: Layer '{layer_name}' not found in model for ablation.")
-                
+                print(f"Warning: Layer '{layer_name}' not found for masking")
+        
         return ablated_model
+
+    def remove_mask_hooks(self):
+        """Remove masking hooks."""
+        if hasattr(self, 'mask_hooks'):
+            for hook in self.mask_hooks:
+                hook.remove()
+            self.mask_hooks.clear()
 
     def _detect_components(self, activations: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
         """Detects components in a hierarchical, network-agnostic way."""
