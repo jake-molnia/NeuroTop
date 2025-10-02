@@ -92,22 +92,38 @@ def get_or_train_model(dataset, model_name, subset_size, models_dir, epochs=50):
     return model, tokenizer
 
 def find_optimal_compression(model, val_loader, analysis_state, pruning_method, 
-                           component=None, percentile=50,
+                           component=None,
                            hard_stop_threshold=5.0, acceptable_threshold=2.0):
-    """Find optimal compression for a specific component using percentile thresholds."""
+    """Find optimal compression for a specific component."""
     
     baseline_acc = evaluate(model, val_loader, quiet=True)
     print(f"Baseline accuracy: {baseline_acc:.2f}%")
-    print(f"Pruning {'whole network' if component is None else f'{component} component'}")
+    print(f"Pruning {component or 'whole network'} component")
     print(f"Hard stop at {hard_stop_threshold:.1f}% drop, acceptable threshold: {acceptable_threshold:.1f}%")
     
+    # Get RF values for this component
+    if component and 'by_components' in analysis_state:
+        rf_vals = analysis_state['by_components'][component]['rf_values']
+    else:
+        rf_vals = analysis_state.get('full_network', {}).get('rf_values', {})
+    
+    # COMPUTE all_rf FIRST
+    all_rf = []
+    for layer_rf in rf_vals.values():
+        if 'rf_0' in layer_rf:
+            all_rf.extend(layer_rf['rf_0'])
+    
+    if not all_rf:
+        print(f"No RF values found for {component}")
+        return baseline_acc, baseline_acc, 0.0
+    
+    # Now use the iterative compression search
     compression = 0.0
     optimal_comp, optimal_acc = 0.0, baseline_acc
     prev_acc = baseline_acc
-    prev_drop = 0.0
     step_size = 1.0
     
-    with tqdm(desc="Finding optimal compression") as pbar:
+    with tqdm(desc=f"Testing {compression:.1f}% compression") as pbar:
         while compression < 95.0:
             compression += step_size
             pbar.set_description(f"Testing {compression:.1f}% compression")
@@ -124,46 +140,19 @@ def find_optimal_compression(model, val_loader, analysis_state, pruning_method,
             
             acc = evaluate(ablated_model, val_loader, quiet=True)
             total_drop = baseline_acc - acc
-            step_drop = prev_acc - acc
             
-            # Hard stop at configurable threshold
             if total_drop >= hard_stop_threshold:
                 print(f"\nHard stop triggered at {compression:.1f}% compression with {total_drop:.2f}% drop")
                 break
             
-            # Momentum stop: if degradation accelerates beyond acceptable threshold
-            if step_drop - prev_drop > acceptable_threshold:
-                print(f"\nMomentum stop triggered at {compression:.1f}% compression with step drop {step_drop:.2f}%")
-                break
-                
-            # Update optimal if within acceptable range
             if total_drop <= acceptable_threshold:
                 optimal_comp, optimal_acc = compression, acc
             
             prev_acc = acc
-            prev_drop = step_drop
             monitor.remove_hooks()
             pbar.update(1)
     
-    threshold = np.percentile(all_rf, percentile)
-    print(f"Pruning neurons with RF < {threshold:.4f} (P{percentile})")
-    
-    # Prune and evaluate
-    with contextlib.redirect_stdout(io.StringIO()):
-        monitor = ActivationMonitor(model, model_type='transformer')
-        ablated_model = monitor.ablate(
-            model,
-            strategy='percent' if pruning_method == 'rf' else 'random',
-            value=threshold,  # Use threshold instead of percentage
-            state=analysis_state,
-            component_name=component
-        )
-    
-    acc = evaluate(ablated_model, val_loader, quiet=True)
-    compression_pct = (1 - len([n for rf in all_rf if rf >= threshold]) / len(all_rf)) * 100
-    
-    monitor.remove_hooks()
-    return baseline_acc, acc, compression_pct
+    return baseline_acc, optimal_acc, optimal_comp
 
 def prune_network_compositionally(model, tokenizer, dataset, strategy):
     """
@@ -235,75 +224,122 @@ def prune_network_compositionally(model, tokenizer, dataset, strategy):
 @click.option('--distance-metric', default='euclidean')
 @click.option('--results-csv', required=True)
 @click.option('--models-dir', default='./trained_models')
-@click.option('--epochs', default=50)
+@click.option('--finetune-epochs', default=10)
+@click.option('--train-epochs', default=50)
 @click.option('--subset-size', default=5000)
-def find_component_compressions(dataset, model_name, pruning_method, distance_metric, 
-                               results_csv, models_dir, epochs, subset_size):
-    """Find optimal compression for each component separately."""
+@click.option('--component-wise/--no-component-wise', default=True, help='Prune each component separately vs whole network')
+def run_experiment(dataset, model_name, pruning_method, distance_metric, results_csv, 
+                  models_dir, finetune_epochs, train_epochs, subset_size, component_wise):
+    """Run compression experiment with optional component-wise analysis."""
     
     print(f"\n{'='*60}")
-    print(f"Finding component-wise compression for {model_name} on {dataset}")
+    print(f"Experiment: {model_name} on {dataset}")
+    print(f"Mode: {'Component-wise' if component_wise else 'Whole network'} pruning")
     print(f"{'='*60}\n")
     
-    # Load model
-    model, tokenizer = get_or_train_model(dataset, model_name, subset_size, models_dir, epochs)
-    _, val_loader = prepare_dataset(dataset, subset_size, tokenizer)
+    # Load/train model
+    model, tokenizer = get_or_train_model(dataset, model_name, subset_size, models_dir, train_epochs)
+    train_loader, val_loader = prepare_dataset(dataset, subset_size, tokenizer)
+    baseline_acc = evaluate(model, val_loader, quiet=True)
     
-    # Analyze topology once to get RF values for ALL components
+    # Analyze topology
     print("Analyzing topology...")
     monitor = ActivationMonitor(model, model_type='transformer')
     analysis_state = monitor.analyze(val_loader, epoch=0, save=False,
                                    distance_metric=distance_metric, max_dim=1, 
-                                   analyze_by_components=True)
+                                   analyze_by_components=component_wise)
     monitor.remove_hooks()
     
-    # Components to test
-    components = ['query', 'key', 'value', 'intermediate']
-    
-    # Find optimal compression for each component
-    results = []
-    for component in components:
-        if component not in analysis_state['by_components']:
-            print(f"Skipping {component} - not found in model")
-            continue
-            
-        print(f"\n{'='*60}")
-        print(f"Testing {component.upper()} component")
-        print(f"{'='*60}")
+    if component_wise:
+        # Find optimal compression for each component independently
+        components = [c for c in analysis_state['by_components'].keys() 
+                     if c not in ['attention.output', 'mlp.output']]
         
-        baseline, optimal, compression = find_optimal_compression(
+        configs = {}
+        for component in components:
+            print(f"\nTesting {component}...")
+            _, _, compression = find_optimal_compression(
+                model, val_loader, analysis_state, pruning_method,
+                component=component, hard_stop_threshold=5.0, acceptable_threshold=2.0
+            )
+            configs[component] = compression
+            print(f"  → {compression:.1f}% safe")
+        
+        # Apply all pruning at once
+        print(f"\nApplying all component pruning simultaneously...")
+        pruned_model = model
+        monitor = ActivationMonitor(model, model_type='transformer')
+        for component, compression in configs.items():
+            pruned_model = monitor.ablate(
+                pruned_model, 
+                strategy='random' if pruning_method == 'random' else 'percent',
+                value=compression, state=analysis_state, component_name=component
+            )
+        monitor.remove_hooks()
+        
+    else:
+        # Whole network pruning (original approach)
+        print("Finding optimal whole-network compression...")
+        _, _, compression = find_optimal_compression(
             model, val_loader, analysis_state, pruning_method,
-            component=component,
-            hard_stop_threshold=5.0,
-            acceptable_threshold=2.0
+            component=None, hard_stop_threshold=5.0, acceptable_threshold=2.0
         )
         
-        results.append({
-            'Component': component,
-            'Method': pruning_method,
-            'Baseline': f"{baseline:.2f}",
-            'Optimal': f"{optimal:.2f}",
-            'Delta': f"{baseline - optimal:.2f}",
-            'Compression': f"{compression:.1f}%"
-        })
+        monitor = ActivationMonitor(model, model_type='transformer')
+        pruned_model = monitor.ablate(
+            model, strategy='random' if pruning_method == 'random' else 'percent',
+            value=compression, state=analysis_state, component_name=None
+        )
+        monitor.remove_hooks()
+    
+    # Evaluate before fine-tuning
+    before_ft = evaluate(pruned_model, val_loader, quiet=True)
+    
+    # Fine-tune
+    print(f"\nFine-tuning for {finetune_epochs} epochs...")
+    optimizer = optim.AdamW(pruned_model.parameters(), lr=2e-5)
+    
+    for epoch in range(finetune_epochs):
+        pruned_model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{finetune_epochs}"):
+            optimizer.zero_grad()
+            batch = {k: v.to(device) for k, v in batch.items()}
+            loss = pruned_model(**batch).loss
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
         
-        print(f"\n{component}: {baseline:.2f}% → {optimal:.2f}% at {compression:.1f}% compression")
+        if (epoch + 1) % 5 == 0:
+            val_acc = evaluate(pruned_model, val_loader, quiet=True)
+            print(f"  Epoch {epoch+1}: Val Acc={val_acc:.2f}%")
+    
+    final_acc = evaluate(pruned_model, val_loader, quiet=True)
     
     # Save results
     os.makedirs(os.path.dirname(results_csv), exist_ok=True)
-    
-    with open(results_csv, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Component', 'Method', 'Baseline', 
-                                              'Optimal', 'Delta', 'Compression'])
-        writer.writeheader()
-        writer.writerows(results)
+    with open(results_csv, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['Model', 'Method', 'Baseline', 
+                                               'After Pruning', 'After FT', 'Delta'])
+        if not os.path.exists(results_csv) or os.path.getsize(results_csv) == 0:
+            writer.writeheader()
+        
+        writer.writerow({
+            'Model': model_name.split('-')[1].title(),
+            'Method': f"{pruning_method} ({'comp' if component_wise else 'full'})",
+            'Baseline': f"{baseline_acc:.2f}",
+            'After Pruning': f"{before_ft:.2f}",
+            'After FT': f"{final_acc:.2f}",
+            'Delta': f"{baseline_acc - final_acc:.2f}"
+        })
     
     print(f"\n{'='*60}")
-    print("SUMMARY")
+    print("RESULTS")
     print(f"{'='*60}")
-    for r in results:
-        print(f"{r['Component']:12} | {r['Compression']:>6} compression | Δ {r['Delta']:>5}%")
+    print(f"Baseline:       {baseline_acc:.2f}%")
+    print(f"After pruning:  {before_ft:.2f}% (Δ {baseline_acc - before_ft:.2f}%)")
+    print(f"After finetune: {final_acc:.2f}% (Δ {baseline_acc - final_acc:.2f}%)")
     print(f"\nResults saved to {results_csv}")
 
 if __name__ == '__main__':
-    find_component_compressions()
+    run_experiment()
