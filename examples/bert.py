@@ -138,6 +138,8 @@ def prune_by_total_percentage(model, analysis_state, pruning_method, target_pct,
     # Sort by RF score (lowest first for RF-based pruning)
     if pruning_method == 'rf':
         all_neurons.sort(key=lambda x: x[3])
+    elif pruning_method == 'random':
+        np.random.shuffle(all_neurons)
     else:
         raise ValueError(f"Unknown pruning method: {pruning_method}")
     
