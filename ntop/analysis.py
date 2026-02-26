@@ -48,7 +48,7 @@ def _filter_inactive_neurons(activations: Dict[str, torch.Tensor], threshold: fl
         neuron_variance = layer_acts.var(dim=0)
         active_mask = neuron_variance > threshold
         
-        if active_mask.sum() > 0:
+        if active_mask.any():
             filtered[layer_name] = layer_acts[:, active_mask]
         else:
             # It's better to warn than to raise an error, to allow analysis to continue.
