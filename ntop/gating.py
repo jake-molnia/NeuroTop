@@ -4,229 +4,178 @@ import numpy as np
 from typing import Dict, List, Optional, Any
 
 
-class LayerwiseThresholdGating(nn.Module):
+class LayerwiseThresholds(nn.Module):
     """
-    Per-layer differentiable gating via learned threshold and temperature.
+    Per-layer learned threshold (τ) and temperature (log_temp).
 
-    For each neuron i in layer l:
-        gate_i = sigmoid( (rf_i - τ_l) / t_l )
+    gate_i = sigmoid((rf_i - τ_l) / exp(log_temp_l))
 
-    τ_l (threshold): where the sigmoid is centered — neurons with rf > τ survive.
-    t_l (temperature): controls sharpness. High t → soft/uniform. Low t → hard binary.
-
-    Both are learned per-layer so each layer can independently decide
-    how aggressively to prune and at what RF cutoff.
+    τ is initialized to the mean RF score of the layer so the sigmoid
+    starts centered on the actual data distribution.
     """
 
-    def __init__(self, layer_names: List[str],
-                 init_threshold: float = 0.0,
-                 init_temp: float = 1.0):
+    def __init__(self, layer_names: List[str], rf_scores: Dict[str, np.ndarray]):
         super().__init__()
-        # nn.ParameterDict keys cannot contain '.' so we replace with '__'
-        self.tau = nn.ParameterDict({
-            self._key(name): nn.Parameter(torch.tensor(init_threshold))
-            for name in layer_names
-        })
-        # Store log(temp) so temp = exp(log_temp) is always positive
-        self.log_temp = nn.ParameterDict({
-            self._key(name): nn.Parameter(torch.tensor(float(np.log(init_temp))))
-            for name in layer_names
-        })
+        # nn.ParameterDict doesn't allow '.' in keys
+        self._key = lambda n: n.replace('.', '__')
 
-    def _key(self, layer_name: str) -> str:
-        return layer_name.replace('.', '__')
+        taus, log_temps = {}, {}
+        for name in layer_names:
+            key = self._key(name)
+            init_tau = float(rf_scores[name].mean()) if name in rf_scores and rf_scores[name].std() > 1e-8 else 0.0
+            taus[key] = nn.Parameter(torch.tensor(init_tau))
+            log_temps[key] = nn.Parameter(torch.tensor(0.0))  # temp = exp(0) = 1.0
 
-    def forward(self, layer_name: str, rf_scores: torch.Tensor) -> torch.Tensor:
+        self.tau = nn.ParameterDict(taus)
+        self.log_temp = nn.ParameterDict(log_temps)
+
+    def forward(self, layer_name: str, rf_tensor: torch.Tensor) -> torch.Tensor:
         key = self._key(layer_name)
-        if key not in self.tau:
-            return torch.ones(rf_scores.shape[0], device=rf_scores.device)
         tau = self.tau[key]
         temp = torch.exp(self.log_temp[key]).clamp(min=1e-4)
-        return torch.sigmoid((rf_scores - tau) / temp)
+        return torch.sigmoid((rf_tensor - tau) / temp)
 
-    def layer_stats(self) -> Dict[str, Dict[str, float]]:
-        """Return current τ and t for each layer — useful for logging."""
-        stats = {}
-        for key in self.tau:
-            layer_name = key.replace('__', '.')
-            stats[layer_name] = {
-                'tau': self.tau[key].item(),
-                'temp': torch.exp(self.log_temp[key]).item(),
+    def stats(self) -> Dict[str, Dict[str, float]]:
+        return {
+            k.replace('__', '.'): {
+                'tau': self.tau[k].item(),
+                'temp': torch.exp(self.log_temp[k]).item(),
             }
-        return stats
+            for k in self.tau
+        }
 
 
 class GatedPruning:
-    def __init__(self, model: nn.Module, device: torch.device,
-                 lambda_sparse: float = 0.01,
-                 lambda_topo: float = 0.1,
-                 lambda_polar: float = 0.01):
+    """
+    Differentiable gating over neurons using per-layer learned thresholds.
+
+    Workflow:
+        1. Compute RF scores (from ntop.monitoring.analyze)
+        2. gated = GatedPruning(model, device, rf_scores)
+        3. In training loop: gated.apply_gates(); loss = gated.compute_loss(task_loss, rf_scores)
+        4. Periodically: gated.hard_prune(threshold)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: torch.device,
+        rf_scores: Dict[str, np.ndarray],
+        lambda_sparse: float = 0.01,
+        lambda_topo: float = 0.1,
+        lambda_polar: float = 0.01,
+    ):
         self.model = model
         self.device = device
         self.lambda_sparse = lambda_sparse
         self.lambda_topo = lambda_topo
         self.lambda_polar = lambda_polar
 
-        # Populated on first compute_gates call once we know which layers have RF scores
-        self.thresholds: Optional[LayerwiseThresholdGating] = None
+        # Only gate Linear layers that have RF scores
+        modules = dict(model.named_modules())
+        self.layer_names = [
+            name for name, mod in modules.items()
+            if isinstance(mod, nn.Linear) and name in rf_scores
+        ]
+
+        self.thresholds = LayerwiseThresholds(self.layer_names, rf_scores).to(device)
         self.gates: Dict[str, torch.Tensor] = {}
-        self.gate_hooks: List = []
-        # Persistent binary mask — neurons zeroed by hard_prune stay dead
-        self.pruned_mask: Dict[str, torch.Tensor] = {}
+        self._hooks: List = []
+        # Permanent binary mask — zeroed neurons stay zeroed
+        self._dead: Dict[str, torch.Tensor] = {}
 
-    def _init_thresholds(self, layer_names: List[str], rf_state: Dict[str, Any]):
-        """
-        Initialize per-layer τ to the mean RF score of that layer so the sigmoid
-        starts centered on the actual data distribution rather than at 0.
-        """
-        rf_values = self._extract_rf(rf_state)
-        self.thresholds = LayerwiseThresholdGating(layer_names).to(self.device)
-
-        with torch.no_grad():
-            for name in layer_names:
-                key = self.thresholds._key(name)
-                if key not in self.thresholds.tau:
-                    continue
-                if name in rf_values:
-                    layer_rf = rf_values[name]
-                    if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
-                        vals = np.array(layer_rf['rf_0'])
-                        init_tau = float(vals.mean()) if vals.std() > 1e-8 else 0.0
-                        self.thresholds.tau[key].fill_(init_tau)
-
-        print(f"Initialized per-layer thresholds for {len(layer_names)} layers.")
-
-    def _extract_rf(self, rf_state: Dict[str, Any]) -> Dict:
-        rf_values = rf_state.get('rf_values', {})
-        if not rf_values:
-            for comp_data in rf_state.get('by_components', {}).values():
-                rf_values.update(comp_data.get('rf_values', {}))
-        return rf_values
-
-    def compute_gates(self, rf_state: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        rf_values = self._extract_rf(rf_state)
-
-        # Collect valid layers (Linear with RF scores)
-        valid_layers = []
-        for layer_name, layer_rf in rf_values.items():
-            if not (isinstance(layer_rf, dict) and 'rf_0' in layer_rf):
-                continue
-            try:
-                module = dict(self.model.named_modules())[layer_name]
-                if isinstance(module, nn.Linear):
-                    valid_layers.append(layer_name)
-            except KeyError:
-                continue
-
-        # Lazy init on first call
-        if self.thresholds is None:
-            self._init_thresholds(valid_layers, rf_state)
-
+    def compute_gates(self, rf_scores: Dict[str, np.ndarray]):
         self.gates.clear()
-        for layer_name in valid_layers:
-            layer_rf = rf_values[layer_name]
-            rf_tensor = torch.tensor(
-                np.array(layer_rf['rf_0']), dtype=torch.float32, device=self.device
+        for name in self.layer_names:
+            if name not in rf_scores:
+                continue
+            rf = torch.tensor(
+                np.log1p(rf_scores[name]), dtype=torch.float32, device=self.device
             )
-            rf_tensor = torch.log1p(rf_tensor)
-            gates = self.thresholds(layer_name, rf_tensor)
+            g = self.thresholds(name, rf)
+            if name in self._dead:
+                g = g * self._dead[name].to(self.device)
+            self.gates[name] = g
 
-            # Zero out permanently pruned neurons
-            if layer_name in self.pruned_mask:
-                gates = gates * self.pruned_mask[layer_name].to(self.device)
+    def apply_gates(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
 
-            self.gates[layer_name] = gates
-
-        return self.gates
-
-    def apply_gates(self, hard_threshold: Optional[float] = None):
-        for hook in self.gate_hooks:
-            hook.remove()
-        self.gate_hooks.clear()
-
-        def make_hook(layer_name, gates, threshold):
-            def hook(module, input, output):
-                g = gates.clone()
-                if threshold is not None:
-                    g = (g >= threshold).float()
-                if output.dim() == 3:
-                    g = g.view(1, 1, -1)
-                elif output.dim() == 2:
-                    g = g.view(1, -1)
-                return output * g
-            return hook
-
-        for layer_name, gates in self.gates.items():
-            try:
-                module = dict(self.model.named_modules())[layer_name]
-                h = module.register_forward_hook(make_hook(layer_name, gates, hard_threshold))
-                self.gate_hooks.append(h)
-            except KeyError:
+        modules = dict(self.model.named_modules())
+        for name, g in self.gates.items():
+            if name not in modules:
                 continue
+            gate = g  # capture
 
-    def hard_prune(self, threshold: float) -> int:
-        """
-        Permanently zero weights for neurons with gate < threshold.
-        Updates pruned_mask so compute_gates keeps them dead going forward.
-        """
+            def hook(_, __, output, _gate=gate):
+                shape = (1, 1, -1) if output.dim() == 3 else (1, -1)
+                return output * _gate.view(*shape)
+
+            self._hooks.append(modules[name].register_forward_hook(hook))
+
+    def hard_prune(self, threshold: float = 0.5) -> int:
+        """Zero weights of neurons with gate < threshold. Permanent."""
+        modules = dict(self.model.named_modules())
         newly_pruned = 0
-        for layer_name, gates in self.gates.items():
-            try:
-                module = dict(self.model.named_modules())[layer_name]
-                if not isinstance(module, nn.Linear):
-                    continue
-                dead = (gates.detach() < threshold)
-                if layer_name not in self.pruned_mask:
-                    self.pruned_mask[layer_name] = torch.ones(
-                        gates.shape[0], dtype=torch.float32
-                    )
-                self.pruned_mask[layer_name][dead.cpu()] = 0.0
-                indices = dead.nonzero(as_tuple=True)[0].cpu()
-                with torch.no_grad():
-                    module.weight.data[indices] = 0.0
-                    if module.bias is not None:
-                        module.bias.data[indices] = 0.0
-                newly_pruned += len(indices)
-            except KeyError:
+        for name, g in self.gates.items():
+            if name not in modules:
                 continue
+            mod = modules[name]
+            if not isinstance(mod, nn.Linear):
+                continue
+            dead = g.detach() < threshold
+            if not dead.any():
+                continue
+            if name not in self._dead:
+                self._dead[name] = torch.ones(g.shape[0])
+            self._dead[name][dead.cpu()] = 0.0
+            idx = dead.nonzero(as_tuple=True)[0]
+            with torch.no_grad():
+                mod.weight.data[idx] = 0.0
+                if mod.bias is not None:
+                    mod.bias.data[idx] = 0.0
+            newly_pruned += len(idx)
         return newly_pruned
 
-    def compute_loss(self, task_loss: torch.Tensor, rf_state: Dict[str, Any]) -> torch.Tensor:
-        total = task_loss
+    def compute_loss(
+        self, task_loss: torch.Tensor, rf_scores: Dict[str, np.ndarray]
+    ) -> torch.Tensor:
+        loss = task_loss
+        total_neurons = sum(len(g) for g in self.gates.values())
+        if total_neurons == 0:
+            return loss
 
-        # Sparsity: penalize active gates (push toward pruning)
-        sparsity = sum(g.sum() for g in self.gates.values())
-        total = total + self.lambda_sparse * sparsity
+        # All terms normalized by neuron count so lambdas are scale-invariant
+        # Sparsity: mean gate value — penalize keeping neurons active
+        sparsity = sum(g.sum() for g in self.gates.values()) / total_neurons
+        loss = loss + self.lambda_sparse * sparsity
 
-        # Topology: penalize pruning high-RF neurons
-        rf_values = self._extract_rf(rf_state)
+        # Topology: penalize pruning high-RF neurons, normalized by total RF mass
         topo = torch.tensor(0.0, device=self.device)
-        for layer_name, gates in self.gates.items():
-            if layer_name in rf_values:
-                layer_rf = rf_values[layer_name]
-                if isinstance(layer_rf, dict) and 'rf_0' in layer_rf:
-                    rf_t = torch.tensor(
-                        np.array(layer_rf['rf_0']), dtype=torch.float32, device=self.device
-                    )
-                    topo = topo + ((1 - gates) * rf_t).sum()
-        total = total + self.lambda_topo * topo
+        for name, g in self.gates.items():
+            if name in rf_scores:
+                rf = torch.tensor(rf_scores[name], dtype=torch.float32, device=self.device)
+                topo = topo + ((1 - g) * rf).sum()
+        topo = topo / total_neurons
+        loss = loss + self.lambda_topo * topo
 
-        # Polarization: push gates toward 0 or 1, away from 0.5
-        polar = sum((g * (1 - g)).sum() for g in self.gates.values())
-        total = total + self.lambda_polar * polar
+        # Polarization: push gates to 0 or 1, normalized
+        polar = sum((g * (1 - g)).sum() for g in self.gates.values()) / total_neurons
+        loss = loss + self.lambda_polar * polar
 
-        return total
+        return loss
 
-    def get_sparsity_stats(self) -> Dict[str, Any]:
+    def sparsity(self) -> Dict[str, Any]:
         total = sum(len(g) for g in self.gates.values())
         active = sum((g >= 0.5).sum().item() for g in self.gates.values())
         return {
-            'total_neurons': total,
-            'active_neurons': active,
-            'sparsity': 1.0 - (active / total) if total > 0 else 0.0,
+            'total': total,
+            'active': active,
+            'sparsity': 1.0 - active / total if total > 0 else 0.0,
         }
 
     def remove_hooks(self):
-        for hook in self.gate_hooks:
-            hook.remove()
-        self.gate_hooks.clear()
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
