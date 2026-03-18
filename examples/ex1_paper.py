@@ -1,411 +1,322 @@
+"""Grokking experiment with topological analysis.
+
+Trains a small transformer on modular addition — (x + y) mod p — and tracks
+how H0 persistence (RF) scores evolve through the memorization → generalization
+(grokking) transition.
+
+Every ``ANALYSIS_INTERVAL`` epochs the model is paused, activations are
+collected over the test set, and RF scores are computed. Distribution plots
+and persistence diagrams are written to ``plots/``. Summary metrics are saved
+to ``grokking_results.csv``.
+
+After training, a brief statistical analysis of the memorization phase is
+printed (Spearman correlation between epoch and RF mean, changes in percentiles).
+
+Usage
+-----
+    python ex1_paper.py
+"""
+
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
-from ntop.monitoring import ActivationMonitor
-import os
 
-class LivePlot:
-    def __init__(self, title="Training Progress"):
+from ntop.monitoring import collect_over_loader, analyze
+from ntop.plots import plot_rf_distribution, plot_persistence_scatter
+
+
+# ─── Hyperparameters ──────────────────────────────────────────────────────────
+
+MODULUS = 113          # p for (x + y) mod p
+EPOCHS = 10_000
+BATCH_SIZE = 256
+TRAIN_SPLIT = 0.7
+LR = 1e-4
+WEIGHT_DECAY = 0.1
+D_MODEL = 128
+N_HEADS = 4
+MLP_EXPANSION = 4      # MLP hidden dim = MLP_EXPANSION * D_MODEL
+ANALYSIS_INTERVAL = 100
+MAX_SAMPLES = 500      # activations samples for RF estimation
+
+
+# ─── Model ────────────────────────────────────────────────────────────────────
+
+class ModularArithmeticModel(nn.Module):
+    """Small transformer for modular addition: predicts (x + y) mod p.
+
+    Architecture:
+        embedding → single-head self-attention → dense projection
+        → ReLU MLP → unembedding
+
+    Token IDs are 0 … modulus-1 for digits and ``modulus`` for the separator.
+    Input sequences have the form ``[a, b, separator]``; the last token's
+    representation is used as the sequence output.
+    """
+
+    def __init__(self, modulus: int, d_model: int = D_MODEL):
+        super().__init__()
+        self.modulus = modulus
+        self.embed = nn.Embedding(modulus + 1, d_model)
+        self.attention = nn.MultiheadAttention(d_model, num_heads=N_HEADS,
+                                               batch_first=True)
+        self.attention_proj = nn.Linear(d_model, d_model)
+        self.mlp_up = nn.Linear(d_model, MLP_EXPANSION * d_model)
+        self.mlp_down = nn.Linear(MLP_EXPANSION * d_model, d_model)
+        self.unembed = nn.Linear(d_model, modulus)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: ``LongTensor[B, 3]`` — token sequences ``[a, b, separator]``.
+
+        Returns:
+            ``FloatTensor[B, modulus]`` — unnormalised class logits.
+        """
+        h = self.embed(x)                                 # [B, 3, d_model]
+        attn_out, _ = self.attention(h, h, h)
+        h = self.attention_proj(attn_out)[:, -1, :]       # last token: [B, d_model]
+        h = self.mlp_down(torch.relu(self.mlp_up(h)))
+        return self.unembed(h)
+
+
+# ─── Dataset ──────────────────────────────────────────────────────────────────
+
+class ModularAdditionDataset(Dataset):
+    """All ``(x, y)`` pairs for modular addition: label = ``(x + y) mod p``."""
+
+    def __init__(self, modulus: int):
+        pairs = [
+            (torch.tensor([x, y, modulus]),
+             torch.tensor((x + y) % modulus))
+            for x in range(modulus)
+            for y in range(modulus)
+        ]
+        np.random.shuffle(pairs)
+        self.data = pairs
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+# ─── Live loss plot ────────────────────────────────────────────────────────────
+
+class LiveLossPlot:
+    """Interactive matplotlib window that updates train/test loss during training."""
+
+    def __init__(self, title: str = "Training Progress"):
         plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(10, 6))
         self.fig.suptitle(title)
-        self.ax.set_xlabel("Epochs")
+        self.ax.set_xlabel("Epoch")
         self.ax.set_ylabel("Loss")
-        self.ax.set_yscale('log')
+        self.ax.set_yscale("log")
         self.ax.grid(True)
-        self.lines = {}
-        self.data = defaultdict(list)
-        self.steps = defaultdict(list)
+        self._lines: dict = {}
+        self._data: dict = defaultdict(list)
+        self._steps: dict = defaultdict(list)
 
-    def update(self, metric_name, value, step=None):
-        if step is None:
-            step = len(self.data[metric_name])
-        self.data[metric_name].append(value)
-        self.steps[metric_name].append(step)
-        if metric_name not in self.lines:
-            (line,) = self.ax.plot([], [], label=metric_name)
-            self.lines[metric_name] = line
+    def update(self, metric: str, value: float, step: int) -> None:
+        """Add one data point and redraw the plot."""
+        self._data[metric].append(value)
+        self._steps[metric].append(step)
+        if metric not in self._lines:
+            (line,) = self.ax.plot([], [], label=metric)
+            self._lines[metric] = line
             self.ax.legend()
-        self.lines[metric_name].set_data(self.steps[metric_name], self.data[metric_name])
+        self._lines[metric].set_data(self._steps[metric], self._data[metric])
         self.ax.relim()
         self.ax.autoscale_view()
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         plt.pause(0.001)
 
-    def final_save(self):
+    def save(self, path: str = "training_progress.png") -> None:
+        """Save the final figure to disk."""
         plt.ioff()
-        self.fig.savefig("final_training_plot.png")
-        print("Final plot saved to final_training_plot.png")
+        self.fig.savefig(path)
+        print(f"Training plot saved to {path}")
 
-    def close(self):
+    def close(self) -> None:
         plt.close(self.fig)
 
-class ModularArithmetic(nn.Module):
-    def __init__(self, modulus, d_model=128):
-        super().__init__()
-        self.modulus = modulus
-        self.embed = nn.Embedding(modulus + 1, d_model)
-        
-        self.attention = nn.MultiheadAttention(d_model, 4, batch_first=True)
-        self.attention_output_dense = nn.Linear(d_model, d_model)
-        
-        self.intermediate_dense = nn.Linear(d_model, 512)
-        self.activation = nn.ReLU()
-        self.output_dense = nn.Linear(512, d_model)
-        
-        self.unembed = nn.Linear(d_model, modulus)
-        
-    def forward(self, x):
-        x = self.embed(x)
-        attn_out, _ = self.attention(x, x, x)
-        attn_out = self.attention_output_dense(attn_out)
-        x = attn_out[:, -1, :]
-        
-        x = self.intermediate_dense(x)
-        x = self.activation(x)
-        x = self.output_dense(x)
-        
-        return self.unembed(x)
 
-class ModularDataset(Dataset):
-    def __init__(self, modulus):
-        self.data = []
-        for x in range(modulus):
-            for y in range(modulus):
-                result = (x + y) % modulus
-                self.data.append((
-                    torch.tensor([x, y, modulus]),
-                    torch.tensor(result)
-                ))
-        np.random.shuffle(self.data)
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        return self.data[idx]
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def plot_rf_outliers(rf_values, epoch, output_dir='plots'):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    all_rf0 = []
-    all_rf1 = []
-    layer_info = []
-    
-    for comp_name, comp_data in rf_values.items():
-        if 'rf_values' in comp_data:
-            for layer, rf_dict in comp_data['rf_values'].items():
-                if 'rf_0' in rf_dict:
-                    vals = rf_dict['rf_0']
-                    all_rf0.extend(vals)
-                    layer_info.extend([(v, layer, 'rf_0') for v in vals])
-                if 'rf_1' in rf_dict:
-                    vals = rf_dict['rf_1']
-                    all_rf1.extend(vals)
-    
-    if not all_rf0:
-        return
-    
-    all_rf0 = np.array(all_rf0)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. Distribution with 1% outliers highlighted
-    ax = axes[0, 0]
-    threshold_99 = np.percentile(all_rf0, 99)
-    threshold_1 = np.percentile(all_rf0, 1)
-    
-    ax.hist(all_rf0, bins=50, alpha=0.7, color='blue', label='All values')
-    outliers_high = all_rf0[all_rf0 >= threshold_99]
-    outliers_low = all_rf0[all_rf0 <= threshold_1]
-    
-    ax.hist(outliers_high, bins=20, alpha=0.9, color='red', label=f'Top 1% (>{threshold_99:.4f})')
-    ax.hist(outliers_low, bins=20, alpha=0.9, color='orange', label=f'Bottom 1% (<{threshold_1:.4f})')
-    ax.set_xlabel('RF_0 Value')
-    ax.set_ylabel('Count')
-    ax.set_title(f'RF_0 Distribution (Epoch {epoch})')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # 2. Box plot showing outliers
-    ax = axes[0, 1]
-    bp = ax.boxplot(all_rf0, vert=True, patch_artist=True, 
-                     showfliers=True, flierprops=dict(marker='o', markersize=4, alpha=0.5))
-    bp['boxes'][0].set_facecolor('lightblue')
-    ax.set_ylabel('RF_0 Value')
-    ax.set_title(f'RF_0 Box Plot with Outliers (Epoch {epoch})')
-    ax.grid(True, alpha=0.3)
-    
-    # 3. Sorted RF values with percentile lines
-    ax = axes[1, 0]
-    sorted_rf = np.sort(all_rf0)
-    ax.plot(sorted_rf, linewidth=1)
-    ax.axhline(threshold_99, color='red', linestyle='--', label='99th percentile')
-    ax.axhline(threshold_1, color='orange', linestyle='--', label='1st percentile')
-    ax.axhline(np.median(all_rf0), color='green', linestyle='--', label='Median')
-    ax.set_xlabel('Neuron Index (sorted)')
-    ax.set_ylabel('RF_0 Value')
-    ax.set_title(f'Sorted RF_0 Values (Epoch {epoch})')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    # 4. Statistics table
-    ax = axes[1, 1]
-    ax.axis('off')
-    
-    stats_text = f"""
-    Epoch: {epoch}
-    
-    RF_0 Statistics:
-    Total neurons: {len(all_rf0):,}
-    Mean: {np.mean(all_rf0):.4f}
-    Median: {np.median(all_rf0):.4f}
-    Std: {np.std(all_rf0):.4f}
-    
-    Min: {np.min(all_rf0):.4f}
-    Max: {np.max(all_rf0):.4f}
-    Range: {np.ptp(all_rf0):.4f}
-    
-    99th percentile: {threshold_99:.4f}
-    1st percentile: {threshold_1:.4f}
-    
-    Top 1% neurons: {len(outliers_high):,}
-    Bottom 1% neurons: {len(outliers_low):,}
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[float, float]:
+    """Evaluate classification accuracy and mean cross-entropy loss.
+
+    Returns:
+        ``(accuracy, mean_loss)`` — accuracy in ``[0, 1]``, loss per sample.
     """
-    
-    ax.text(0.1, 0.9, stats_text, transform=ax.transAxes, 
-            fontsize=10, verticalalignment='top', family='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/rf_outliers_epoch_{epoch}.png', dpi=150)
-    plt.close(fig)
-    
-    print(f"  Saved RF outlier analysis to {output_dir}/rf_outliers_epoch_{epoch}.png")
-
-def plot_persistence_diagrams(topo_data, epoch, output_dir='plots'):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Collect RF values for all dimensions
-    rf_data = {'rf_0': [], 'rf_1': [], 'rf_2': []}
-    
-    if 'by_components' in topo_data:
-        for comp_data in topo_data['by_components'].values():
-            if 'rf_values' in comp_data:
-                for layer_rf in comp_data['rf_values'].values():
-                    for dim in ['rf_0', 'rf_1', 'rf_2']:
-                        if dim in layer_rf:
-                            rf_data[dim].extend(layer_rf[dim])
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    colors = ['blue', 'green', 'red']
-    dims = ['H0 (Components)', 'H1 (Loops)', 'H2 (Voids)']
-    markers = ['o', 's', '^']
-    max_val = 0
-    
-    for rf_key, color, dim_name, marker in zip(['rf_0', 'rf_1', 'rf_2'], colors, dims, markers):
-        if rf_data[rf_key]:
-            values = np.array(rf_data[rf_key])
-            values = values[np.isfinite(values)]
-            
-            if len(values) > 0:
-                births = np.zeros_like(values)
-                deaths = values
-                
-                ax.scatter(births, deaths, alpha=0.6, s=30, c=color, marker=marker, 
-                          label=f'{dim_name} ({len(values)} features)')
-                
-                max_val = max(max_val, np.max(deaths))
-                
-                # Highlight top 1% for each dimension
-                if len(values) > 10:
-                    threshold_99 = np.percentile(deaths, 99)
-                    outliers_mask = deaths >= threshold_99
-                    ax.scatter(births[outliers_mask], deaths[outliers_mask], 
-                              alpha=0.9, s=80, c=color, marker='*', 
-                              edgecolors='black', linewidths=1)
-    
-    # Diagonal line
-    if max_val > 0:
-        ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, linewidth=2, label='Diagonal')
-    
-    ax.set_xlabel('Birth', fontsize=12)
-    ax.set_ylabel('Death (RF Value)', fontsize=12)
-    ax.set_title(f'Persistence Diagram - All Dimensions (Epoch {epoch})', fontsize=14)
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/persistence_epoch_{epoch}.png', dpi=150)
-    plt.close(fig)
-    
-    print(f"  Saved persistence diagram to {output_dir}/persistence_epoch_{epoch}.png")
-        
-def train_grokking_with_topology():
-    modulus = 113
-    epochs = 10000
-    batch_size = 256
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ModularArithmetic(modulus).to(device)
-    
-    dataset = ModularDataset(modulus)
-    split = int(len(dataset) * 0.7)
-    train_data = torch.utils.data.Subset(dataset, range(split))
-    test_data = torch.utils.data.Subset(dataset, range(split, len(dataset)))
-    
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=batch_size, shuffle=False)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
     criterion = nn.CrossEntropyLoss()
-    
-    monitor = ActivationMonitor(model, model_type='mlp')
-    plot = LivePlot("Grokking: Train/Test Loss")
+    model.eval()
+    correct = total = 0
+    total_loss = 0.0
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            logits = model(inputs)
+            total_loss += criterion(logits, targets).item() * len(targets)
+            correct += (logits.argmax(1) == targets).sum().item()
+            total += len(targets)
+    return correct / total, total_loss / total
+
+
+# ─── Main experiment ──────────────────────────────────────────────────────────
+
+def run_grokking_experiment() -> None:
+    """Train on modular addition and track RF score evolution through grokking.
+
+    Writes per-epoch plots to ``plots/``, summary metrics to
+    ``grokking_results.csv``, and RF history to ``rf_history.npz``.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ModularArithmeticModel(MODULUS).to(device)
+
+    dataset = ModularAdditionDataset(MODULUS)
+    split = int(len(dataset) * TRAIN_SPLIT)
+    train_set = torch.utils.data.Subset(dataset, range(split))
+    test_set = torch.utils.data.Subset(dataset, range(split, len(dataset)))
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
+                                  weight_decay=WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss()
+
+    print(f"Modulus p={MODULUS}  |  train={len(train_set)}  |  test={len(test_set)}")
+
+    live_plot = LiveLossPlot("Grokking: Train/Test Loss")
     results = []
-    
-    print(f"Training on modulus {modulus} for {epochs} epochs")
-    print(f"Train size: {len(train_data)}, Test size: {len(test_data)}")
-    
-    for epoch in range(epochs):
+    rf_history: list[dict] = []
+    checkpoint_epochs: list[int] = []
+
+    for epoch in range(EPOCHS):
+        # ── Training step ────────────────────────────────────────────────────
         model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        
-        for batch in train_loader:
-            inputs, targets = batch[0].to(device), batch[1].to(device)
-            
+        train_loss = train_correct = train_total = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            logits = model(inputs)
+            loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
-            
-            train_loss += loss.item() * len(targets)
-            train_correct += (outputs.argmax(1) == targets).sum().item()
-            train_total += len(targets)
-        
+            with torch.no_grad():
+                train_loss += loss.item() * len(targets)
+                train_correct += (logits.argmax(1) == targets).sum().item()
+                train_total += len(targets)
+
         train_acc = train_correct / train_total
-        train_loss = train_loss / train_total
-        
-        model.eval()
-        test_correct = 0
-        test_total = 0
-        test_loss = 0
-        
-        with torch.no_grad():
-            for batch in test_loader:
-                inputs, targets = batch[0].to(device), batch[1].to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                test_loss += loss.item() * len(targets)
-                test_correct += (outputs.argmax(1) == targets).sum().item()
-                test_total += len(targets)
-        
-        test_acc = test_correct / test_total
-        test_loss = test_loss / test_total
-        
-        plot.update('train_loss', train_loss, epoch)
-        plot.update('test_loss', test_loss, epoch)
-        
-        if epoch % 100 == 0 or epoch == epochs - 1:
-            print(f"\nEpoch {epoch}: Train Acc={train_acc:.3f}, Test Acc={test_acc:.3f}, Train Loss={train_loss:.4f}, Test Loss={test_loss:.4f}")
-                
+        train_loss_avg = train_loss / train_total
+
+        # ── Evaluation and topology analysis ─────────────────────────────────
+        if epoch % ANALYSIS_INTERVAL == 0 or epoch == EPOCHS - 1:
+            test_acc, test_loss_avg = evaluate(model, test_loader, device)
+
+            live_plot.update("train_loss", train_loss_avg, epoch)
+            live_plot.update("test_loss", test_loss_avg, epoch)
+
+            print(f"\nEpoch {epoch:5d}: "
+                  f"train_acc={train_acc:.3f}  test_acc={test_acc:.3f}  "
+                  f"train_loss={train_loss_avg:.4f}  test_loss={test_loss_avg:.4f}")
+
             try:
-                torch.save(model.state_dict(), f'model_step_{epoch}.pt')
-                topo = monitor.analyze(test_loader, epoch, save=True,
-                                        distance_metric='euclidean',
-                                        max_dim=2,
-                                        analyze_by_components=True,
-                                        max_samples=500)
-                
-                all_rf0 = []
-                
-                if 'by_components' in topo:
-                    for comp_name, comp_data in topo['by_components'].items():
-                        if 'rf_values' in comp_data:
-                            for layer, rf_dict in comp_data['rf_values'].items():
-                                if 'rf_0' in rf_dict:
-                                    all_rf0.extend(rf_dict['rf_0'])
-                
-                if all_rf0:
-                    rf0_mean = np.mean(all_rf0)
-                    rf0_max = np.max(all_rf0)
-                    
-                    results.append({
-                        'epoch': epoch,
-                        'train_acc': train_acc,
-                        'test_acc': test_acc,
-                        'train_loss': train_loss,
-                        'test_loss': test_loss,
-                        'rf0_mean': rf0_mean,
-                        'rf0_max': rf0_max,
-                        'rf0_std': np.std(all_rf0),
-                        'rf0_99th': np.percentile(all_rf0, 99),
-                        'rf0_1st': np.percentile(all_rf0, 1)
-                    })
-                    
-                    # Generate plots
-                    plot_rf_outliers(topo['by_components'], epoch)
-                    plot_persistence_diagrams(topo, epoch)
-                    
-            except Exception as e:
-                print(f"Topology analysis failed at epoch {epoch}: {e}")
-                import traceback
-                traceback.print_exc()
-    
-    plot.final_save()
-    monitor.save_states('grokking_topology_states.npz')
-    
+                acts = collect_over_loader(model, test_loader,
+                                           max_samples=MAX_SAMPLES, verbose=False)
+                rf_scores = analyze(acts)
+                all_rf = np.concatenate(list(rf_scores.values()))
+
+                plot_rf_distribution(rf_scores, epoch)
+                plot_persistence_scatter(rf_scores, epoch)
+
+                rf_history.append({k: v.copy() for k, v in rf_scores.items()})
+                checkpoint_epochs.append(epoch)
+
+                results.append({
+                    "epoch": epoch,
+                    "train_acc": train_acc,
+                    "test_acc": test_acc,
+                    "train_loss": train_loss_avg,
+                    "test_loss": test_loss_avg,
+                    "rf_mean": float(np.mean(all_rf)),
+                    "rf_max": float(np.max(all_rf)),
+                    "rf_std": float(np.std(all_rf)),
+                    "rf_p99": float(np.percentile(all_rf, 99)),
+                    "rf_p1": float(np.percentile(all_rf, 1)),
+                })
+            except Exception as exc:
+                print(f"  Topology analysis failed at epoch {epoch}: {exc}")
+        else:
+            # Update live plot with train loss on non-analysis epochs
+            live_plot.update("train_loss", train_loss_avg, epoch)
+
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    live_plot.save("training_progress.png")
+    live_plot.close()
+
+    np.savez(
+        "rf_history.npz",
+        epochs=np.array(checkpoint_epochs),
+        **{f"epoch_{e}": np.concatenate(list(s.values()))
+           for e, s in zip(checkpoint_epochs, rf_history)},
+    )
+
     import pandas as pd
     df = pd.DataFrame(results)
-    df.to_csv('grokking_topology_results.csv', index=False)
-    
+    df.to_csv("grokking_results.csv", index=False)
+    print("\nSaved: grokking_results.csv, rf_history.npz, plots/")
+
+    # ── Grokking analysis ────────────────────────────────────────────────────
     print("\n=== GROKKING ANALYSIS ===")
-    if len(df) > 0 and 'test_acc' in df.columns:
-        grok_rows = df[df['test_acc'] > 0.95]
-        grok_point = grok_rows.iloc[0]['epoch'] if len(grok_rows) > 0 else None
-        
-        if grok_point:
-            print(f"Grokking occurred at epoch {grok_point}")
-            
-            pre_grok = df[df['epoch'] < grok_point]
-            
-            if len(pre_grok) > 2 and 'rf0_mean' in pre_grok.columns:
-                from scipy.stats import spearmanr
-                
-                flat_period = pre_grok[(pre_grok['test_acc'] < 0.5) & (pre_grok['train_acc'] > 0.95)]
-                
-                if len(flat_period) > 1:
-                    print("\n=== FLAT PERIOD (memorization) ===")
-                    rf0_start = flat_period['rf0_mean'].iloc[0]
-                    rf0_end = flat_period['rf0_mean'].iloc[-1]
-                    pct_change = ((rf0_end - rf0_start) / rf0_start) * 100
-                    print(f"RF0 mean changed by {pct_change:+.1f}% during flat period")
-                    print(f"Start: {rf0_start:.4f}, End: {rf0_end:.4f}")
-                    
-                    # Check outlier changes
-                    outlier_99_start = flat_period['rf0_99th'].iloc[0]
-                    outlier_99_end = flat_period['rf0_99th'].iloc[-1]
-                    outlier_change = ((outlier_99_end - outlier_99_start) / outlier_99_start) * 100
-                    print(f"Top 1% (99th percentile) changed by {outlier_change:+.1f}%")
-                    print(f"Start: {outlier_99_start:.4f}, End: {outlier_99_end:.4f}")
-                    
-                    corr, pval = spearmanr(flat_period['epoch'], flat_period['rf0_mean'])
-                    print(f"Correlation RF0 vs epoch during flat: r={corr:.3f}, p={pval:.3f}")
-        else:
-            print("No grokking observed (test accuracy never exceeded 0.95)")
-    
-    plot.close()
-    return df, monitor.topology_states
+    if df.empty or "test_acc" not in df.columns:
+        return
+
+    grok_rows = df[df["test_acc"] > 0.95]
+    if grok_rows.empty:
+        print("No grokking observed (test accuracy never exceeded 0.95).")
+        return
+
+    grok_epoch = int(grok_rows.iloc[0]["epoch"])
+    print(f"Grokking occurred at epoch {grok_epoch}.")
+
+    # Memorization phase: model fits training data but hasn't generalised yet
+    pre_grok = df[df["epoch"] < grok_epoch]
+    memorization = pre_grok[
+        (pre_grok["train_acc"] > 0.95) & (pre_grok["test_acc"] < 0.5)
+    ]
+
+    if len(memorization) > 1:
+        from scipy.stats import spearmanr
+
+        print("\n=== MEMORIZATION PHASE ===")
+        rf_start = memorization["rf_mean"].iloc[0]
+        rf_end = memorization["rf_mean"].iloc[-1]
+        pct_change = (rf_end - rf_start) / rf_start * 100
+        print(f"RF mean:  {rf_start:.4f} → {rf_end:.4f}  ({pct_change:+.1f}%)")
+
+        p99_start = memorization["rf_p99"].iloc[0]
+        p99_end = memorization["rf_p99"].iloc[-1]
+        p99_change = (p99_end - p99_start) / p99_start * 100
+        print(f"RF p99:   {p99_start:.4f} → {p99_end:.4f}  ({p99_change:+.1f}%)")
+
+        corr, pval = spearmanr(memorization["epoch"], memorization["rf_mean"])
+        print(f"Spearman(epoch, RF_mean) during memorization: r={corr:.3f}, p={pval:.3f}")
+
 
 if __name__ == "__main__":
-    df, topo_states = train_grokking_with_topology()
-    print("\nResults saved to grokking_topology_results.csv")
-    print("Topology states saved to grokking_topology_states.npz")
+    run_grokking_experiment()

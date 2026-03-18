@@ -79,25 +79,25 @@ def get_or_train(dataset, model_name, subset_size, models_dir, epochs):
 @click.option('--results-csv', required=True)
 @click.option('--models-dir', default='./trained_models')
 @click.option('--train-epochs', default=50)
-@click.option('--gating-epochs', default=20)
 @click.option('--subset-size', default=5000)
 @click.option('--lambda-sparse', default=0.01)
 @click.option('--lambda-topo', default=0.1)
 @click.option('--lambda-polar', default=0.01)
 @click.option('--prune-threshold', default=0.5)
-@click.option('--prune-interval', default=5)
+@click.option('--prune-cycles', default=3, help='Number of gate→prune→finetune cycles')
+@click.option('--gate-epochs', default=5, help='Gate training epochs per cycle')
+@click.option('--finetune-epochs', default=3, help='Model fine-tune epochs after each prune')
 @click.option('--gate-lr', default=1e-3)
 @click.option('--max-samples', default=512)
-def run(dataset, model_name, results_csv, models_dir, train_epochs, gating_epochs,
-        subset_size, lambda_sparse, lambda_topo, lambda_polar,
-        prune_threshold, prune_interval, max_samples, gate_lr):
+def run(dataset, model_name, results_csv, models_dir, train_epochs, subset_size,
+        lambda_sparse, lambda_topo, lambda_polar, prune_threshold,
+        prune_cycles, gate_epochs, finetune_epochs, gate_lr, max_samples):
 
     model, tokenizer = get_or_train(dataset, model_name, subset_size, models_dir, train_epochs)
     train_loader, val_loader = get_loaders(dataset, subset_size, tokenizer)
     baseline = evaluate(model, val_loader)
     print(f"Baseline: {baseline:.2f}%")
 
-    # Collect activations and compute RF scores — no model inspection needed
     print("Collecting activations...")
     acts = collect_over_loader(model, val_loader, max_samples=max_samples)
     rf_scores = analyze(acts)
@@ -107,46 +107,68 @@ def run(dataset, model_name, results_csv, models_dir, train_epochs, gating_epoch
                          lambda_topo=lambda_topo,
                          lambda_polar=lambda_polar)
 
-    model_opt = optim.AdamW(model.parameters(), lr=2e-5)
     gate_opt = optim.Adam(gated.thresholds.parameters(), lr=gate_lr)
 
-    for epoch in range(gating_epochs):
-        model.train()
+    for cycle in range(prune_cycles):
+        print(f"\n--- Cycle {cycle+1}/{prune_cycles} ---")
+
+        # Step 1: Train gates (model frozen, only tau/temp updated)
+        for p in model.parameters():
+            p.requires_grad_(False)
+        model.eval()
         gated.thresholds.train()
 
-        total_loss = 0.0
-        total_task = 0.0
-        for batch in tqdm(train_loader, desc=f"Gate epoch {epoch+1}/{gating_epochs}"):
-            model_opt.zero_grad()
-            gate_opt.zero_grad()
-            # Recompute fresh gates each batch — they're part of the graph via thresholds
+        for epoch in range(gate_epochs):
             gated.compute_gates(rf_scores)
-            gated.apply_gates()
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            task_loss = outputs.loss
-            loss = gated.compute_loss(task_loss, rf_scores)
-            loss.backward()
-            model_opt.step()
-            gate_opt.step()
-            total_loss += loss.item()
-            total_task += task_loss.item()
+            total_loss = total_task = 0.0
+            for batch in tqdm(train_loader, desc=f"  Gate {epoch+1}/{gate_epochs}"):
+                gate_opt.zero_grad()
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.no_grad():
+                    outputs = model(**batch)
+                task_loss = outputs.loss
+                loss = gated.compute_loss(task_loss, rf_scores)
+                loss.backward()
+                gate_opt.step()
+                total_loss += loss.item()
+                total_task += task_loss.item()
+            n = len(train_loader)
+            gated.compute_gates(rf_scores)
+            stats = gated.sparsity()
+            print(f"  Gate {epoch+1}: loss={total_loss/n:.4f} task={total_task/n:.4f} | sparsity={stats['sparsity']*100:.1f}%")
 
-        acc = evaluate(model, val_loader)
+        # Step 2: Hard prune
+        pruned_dict = gated.hard_prune(prune_threshold)
+        total_pruned = sum(len(idx) for idx in pruned_dict.values())
+        gated.compute_gates(rf_scores)
         stats = gated.sparsity()
-        n = len(train_loader)
-        print(f"Epoch {epoch+1}: total={total_loss/n:.4f} task={total_task/n:.4f} | acc={acc:.2f}% | sparsity={stats['sparsity']*100:.1f}%")
 
-        if (epoch + 1) % prune_interval == 0:
-            pruned = gated.hard_prune(prune_threshold)
-            acc = evaluate(model, val_loader)
-            print(f"Hard prune: {pruned} neurons | acc={acc:.2f}%")
+        # Step 3: Eval immediately post-prune
+        acc_post_prune = evaluate(model, val_loader)
+        print(f"  Pruned {total_pruned} neurons | acc={acc_post_prune:.2f}% | cumulative sparsity={stats['sparsity']*100:.1f}%")
 
-            # Refresh RF scores after pruning
-            acts = collect_over_loader(model, val_loader, max_samples=max_samples)
-            rf_scores = analyze(acts)
-            gated.compute_gates(rf_scores)
-            gated.apply_gates()
+        # Step 4: Fine-tune to recover (dead weights re-zeroed after every step)
+        if finetune_epochs > 0 and total_pruned > 0:
+            for p in model.parameters():
+                p.requires_grad_(True)
+            prune_opt = optim.AdamW(model.parameters(), lr=2e-5)
+            for epoch in range(finetune_epochs):
+                model.train()
+                for batch in tqdm(train_loader, desc=f"  Finetune {epoch+1}/{finetune_epochs}"):
+                    prune_opt.zero_grad()
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    model(**batch).loss.backward()
+                    prune_opt.step()
+                    gated.apply_dead_mask()
+
+        # Step 5: Eval after recovery
+        acc_recovered = evaluate(model, val_loader)
+        print(f"  Post-finetune: acc={acc_recovered:.2f}%")
+
+        # Refresh RF scores from the now-pruned model for the next cycle
+        acts = collect_over_loader(model, val_loader, max_samples=max_samples)
+        rf_scores = analyze(acts)
+        gated.compute_gates(rf_scores)
 
     final = evaluate(model, val_loader)
     stats = gated.sparsity()
@@ -166,8 +188,6 @@ def run(dataset, model_name, results_csv, models_dir, train_epochs, gating_epoch
             'Delta': f"{baseline - final:.2f}",
             'Sparsity': f"{stats['sparsity']*100:.1f}%",
         })
-
-    gated.remove_hooks()
 
 
 if __name__ == '__main__':

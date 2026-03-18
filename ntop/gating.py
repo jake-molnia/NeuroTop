@@ -1,3 +1,36 @@
+"""Differentiable gated pruning with per-layer learned thresholds.
+
+Soft gates are computed from RF scores via a per-layer sigmoid:
+
+    gate_i = sigmoid((log1p(rf_i) - τ_l) / exp(log_temp_l))
+
+During gate training the model weights are frozen; only ``τ`` and
+``log_temp`` are updated through a composite loss that balances sparsity,
+topology preservation, and gate polarisation.  Neurons whose gate falls
+below a hard threshold are then permanently zeroed (hard prune) and masked
+after every subsequent optimiser step.
+
+Typical workflow::
+
+    acts = collect_over_loader(model, loader)
+    rf_scores = analyze(acts)
+
+    gated = GatedPruning(model, device, rf_scores)
+    gate_optimizer = torch.optim.Adam(gated.thresholds.parameters(), lr=1e-3)
+
+    for epoch in range(gate_epochs):
+        gated.compute_gates(rf_scores)
+        gated.apply_gates()          # register forward hooks
+        for batch in loader:
+            gate_optimizer.zero_grad()
+            task_loss = model(**batch).loss
+            loss = gated.compute_loss(task_loss, rf_scores)
+            loss.backward()
+            gate_optimizer.step()
+
+    pruned = gated.hard_prune(threshold=0.5)
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -22,7 +55,7 @@ class LayerwiseThresholds(nn.Module):
         taus, log_temps = {}, {}
         for name in layer_names:
             key = self._key(name)
-            init_tau = float(rf_scores[name].mean()) if name in rf_scores and rf_scores[name].std() > 1e-8 else 0.0
+            init_tau = float(np.log1p(rf_scores[name]).mean()) if name in rf_scores and np.log1p(rf_scores[name]).std() > 1e-8 else 0.0
             taus[key] = nn.Parameter(torch.tensor(init_tau))
             log_temps[key] = nn.Parameter(torch.tensor(0.0))  # temp = exp(0) = 1.0
 
@@ -106,7 +139,10 @@ class GatedPruning:
         for name, g in self.gates.items():
             if name not in modules:
                 continue
-            gate = g  # capture
+            # Detach so the hook doesn't hold a reference into the computation
+            # graph — hooks are pure forward masking, gradients flow through
+            # compute_loss instead.
+            gate = g.detach()
 
             def hook(_, __, output, _gate=gate):
                 shape = (1, 1, -1) if output.dim() == 3 else (1, -1)
@@ -114,10 +150,14 @@ class GatedPruning:
 
             self._hooks.append(modules[name].register_forward_hook(hook))
 
-    def hard_prune(self, threshold: float = 0.5) -> int:
-        """Zero weights of neurons with gate < threshold. Permanent."""
+    def hard_prune(self, threshold: float = 0.5) -> Dict[str, torch.Tensor]:
+        """Zero weights of neurons with gate < threshold. Permanent.
+
+        Returns a dict mapping layer_name -> 1-D tensor of pruned neuron indices,
+        so callers can reset the corresponding optimizer state rows.
+        """
         modules = dict(self.model.named_modules())
-        newly_pruned = 0
+        pruned_indices: Dict[str, torch.Tensor] = {}
         for name, g in self.gates.items():
             if name not in modules:
                 continue
@@ -135,25 +175,40 @@ class GatedPruning:
                 mod.weight.data[idx] = 0.0
                 if mod.bias is not None:
                     mod.bias.data[idx] = 0.0
-            newly_pruned += len(idx)
-        return newly_pruned
+            pruned_indices[name] = idx
+        return pruned_indices
 
     def compute_loss(
         self, task_loss: torch.Tensor, rf_scores: Dict[str, np.ndarray]
     ) -> torch.Tensor:
+        # Recompute gates fresh here so gradients flow to tau/temp each batch.
+        # Hooks use detached epoch-start gates for forward masking; this is the
+        # only place where tau/temp receive gradients.
+        live_gates: Dict[str, torch.Tensor] = {}
+        for name in self.layer_names:
+            if name not in rf_scores:
+                continue
+            rf = torch.tensor(
+                np.log1p(rf_scores[name]), dtype=torch.float32, device=self.device
+            )
+            g = self.thresholds(name, rf)
+            if name in self._dead:
+                g = g * self._dead[name].to(self.device)
+            live_gates[name] = g
+
         loss = task_loss
-        total_neurons = sum(len(g) for g in self.gates.values())
+        total_neurons = sum(len(g) for g in live_gates.values())
         if total_neurons == 0:
             return loss
 
         # All terms normalized by neuron count so lambdas are scale-invariant
         # Sparsity: mean gate value — penalize keeping neurons active
-        sparsity = sum(g.sum() for g in self.gates.values()) / total_neurons
+        sparsity = sum(g.sum() for g in live_gates.values()) / total_neurons
         loss = loss + self.lambda_sparse * sparsity
 
         # Topology: penalize pruning high-RF neurons, normalized by total RF mass
         topo = torch.tensor(0.0, device=self.device)
-        for name, g in self.gates.items():
+        for name, g in live_gates.items():
             if name in rf_scores:
                 rf = torch.tensor(rf_scores[name], dtype=torch.float32, device=self.device)
                 topo = topo + ((1 - g) * rf).sum()
@@ -161,7 +216,7 @@ class GatedPruning:
         loss = loss + self.lambda_topo * topo
 
         # Polarization: push gates to 0 or 1, normalized
-        polar = sum((g * (1 - g)).sum() for g in self.gates.values()) / total_neurons
+        polar = sum((g * (1 - g)).sum() for g in live_gates.values()) / total_neurons
         loss = loss + self.lambda_polar * polar
 
         return loss
@@ -174,6 +229,22 @@ class GatedPruning:
             'active': active,
             'sparsity': 1.0 - active / total if total > 0 else 0.0,
         }
+
+    def apply_dead_mask(self):
+        """Re-zero weights for permanently pruned neurons after an optimizer step."""
+        modules = dict(self.model.named_modules())
+        for name, mask in self._dead.items():
+            if name not in modules:
+                continue
+            mod = modules[name]
+            if not isinstance(mod, nn.Linear):
+                continue
+            dead = mask == 0.0
+            if dead.any():
+                with torch.no_grad():
+                    mod.weight.data[dead] = 0.0
+                    if mod.bias is not None:
+                        mod.bias.data[dead] = 0.0
 
     def remove_hooks(self):
         for h in self._hooks:

@@ -1,3 +1,18 @@
+"""H0 persistence computation for neural network activation distributions.
+
+The core ntop importance metric is the *RF (receptive-field) score*: the H0
+persistence of a neuron's activation distribution viewed as a 1-D point cloud.
+Concretely, sort the N activation values for a neuron and find the largest gap
+between consecutive values — that gap is the RF score.
+
+Neurons with high RF scores sit at topological boundaries in the activation
+space and are more informative / harder to replace; neurons with low scores
+(or zero variance) are good pruning candidates.
+
+JAX is used for the inner computation so the sort + diff + max can be
+JIT-compiled and batched over all neurons at once.
+"""
+
 import jax
 import jax.numpy as jnp
 import numpy as np

@@ -110,7 +110,9 @@ dmypy.json
 cython_debug/
 
 # Machine Learning Specific
-# Models
+# Models and generated training artifacts
+trained_models/
+model_step_*.pt
 *.pkl
 *.pickle
 *.joblib
@@ -152,6 +154,7 @@ features/
 logs/
 outputs/
 results/
+plots/
 experiments/
 runs/
 lightning_logs/
