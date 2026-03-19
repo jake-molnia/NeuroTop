@@ -220,3 +220,8 @@ model.ckpt.*
 # Docker
 .dockerignore
 Dockerfile.
+
+# CUSTOM
+.claude/*
+outputs/*
+output/*

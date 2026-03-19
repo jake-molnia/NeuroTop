@@ -150,32 +150,58 @@ class GatedPruning:
 
             self._hooks.append(modules[name].register_forward_hook(hook))
 
-    def hard_prune(self, threshold: float = 0.5) -> Dict[str, torch.Tensor]:
-        """Zero weights of neurons with gate < threshold. Permanent.
+    def hard_prune(self, threshold: float = None) -> Dict[str, torch.Tensor]:
+        """Zero weights of neurons below the per-layer Otsu threshold.
 
-        Returns a dict mapping layer_name -> 1-D tensor of pruned neuron indices,
-        so callers can reset the corresponding optimizer state rows.
+        Uses Otsu's method on each layer's gate values to find the natural
+        binary split — no fixed threshold needed. Falls back to the midpoint
+        if the gate distribution is degenerate (all values identical).
+
+        The ``threshold`` argument is kept for API compatibility but ignored.
         """
+        def otsu_threshold(values: np.ndarray) -> float:
+            if values.max() - values.min() < 1e-6:
+                return values.mean()
+            bins = np.linspace(values.min(), values.max(), 256)
+            best_t, best_var = bins[0], -1.0
+            for t in bins:
+                w0 = (values < t).mean()
+                w1 = 1.0 - w0
+                if w0 == 0 or w1 == 0:
+                    continue
+                var = w0 * w1 * (values[values < t].mean() - values[values >= t].mean()) ** 2
+                if var > best_var:
+                    best_var, best_t = var, t
+            return best_t
+
         modules = dict(self.model.named_modules())
         pruned_indices: Dict[str, torch.Tensor] = {}
+
         for name, g in self.gates.items():
             if name not in modules:
                 continue
             mod = modules[name]
             if not isinstance(mod, nn.Linear):
                 continue
-            dead = g.detach() < threshold
+
+            gate_vals = g.detach().cpu().numpy()
+            cut = otsu_threshold(gate_vals)
+            dead = g.detach() < cut
+
             if not dead.any():
                 continue
+
             if name not in self._dead:
                 self._dead[name] = torch.ones(g.shape[0])
             self._dead[name][dead.cpu()] = 0.0
+
             idx = dead.nonzero(as_tuple=True)[0]
             with torch.no_grad():
                 mod.weight.data[idx] = 0.0
                 if mod.bias is not None:
                     mod.bias.data[idx] = 0.0
             pruned_indices[name] = idx
+
         return pruned_indices
 
     def compute_loss(
@@ -210,7 +236,7 @@ class GatedPruning:
         topo = torch.tensor(0.0, device=self.device)
         for name, g in live_gates.items():
             if name in rf_scores:
-                rf = torch.tensor(rf_scores[name], dtype=torch.float32, device=self.device)
+                rf = torch.tensor(np.log1p(rf_scores[name]), dtype=torch.float32, device=self.device)
                 topo = topo + ((1 - g) * rf).sum()
         topo = topo / total_neurons
         loss = loss + self.lambda_topo * topo
