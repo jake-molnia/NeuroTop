@@ -2,8 +2,8 @@
 
 Usage
 -----
-    python -m examples.modulus.ex2_pruning
-    python -m examples.modulus.ex2_pruning --prune-cycles 4 --finetune-epochs 30
+    uv run -m examples.modulus.ex2_pruning
+    uv run -m examples.modulus.ex2_pruning --prune-cycles 4 --finetune-epochs 30
 """
 
 import os
@@ -74,7 +74,7 @@ def hard_prune(model: nn.Module, gates: dict, prune_mask: dict) -> int:
         if not dead.any():
             continue
         idx = dead.nonzero(as_tuple=True)[0]
-        existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool, device=mod.weight.device))
+        existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool))
         new_idx = idx[existing_mask[idx]]  # only count newly pruned
         existing_mask[idx] = False
         prune_mask[name] = existing_mask

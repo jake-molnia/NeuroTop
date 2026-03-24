@@ -28,3 +28,32 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["ntop*"]
+
+# ── Optional dependency groups ─────────────────────────────────────────────────
+[project.optional-dependencies]
+# Nightly PyTorch with Blackwell (sm_120) support for Turing GPU clusters
+blackwell = [
+    "torch>=2.12.0.dev0",
+    "torchvision>=0.26.0.dev0",
+    "torchaudio>=2.11.0.dev0",
+]
+
+# ── uv index configuration ─────────────────────────────────────────────────────
+[[tool.uv.index]]
+name = "pytorch-nightly-cu128"
+url = "https://download.pytorch.org/whl/nightly/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+]
+torchvision = [
+    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+]
+torchaudio = [
+    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+]
+triton = [
+    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+]
