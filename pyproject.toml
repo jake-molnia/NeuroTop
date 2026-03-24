@@ -36,6 +36,7 @@ blackwell = [
     "torch>=2.12.0.dev0",
     "torchvision>=0.26.0.dev0",
     "torchaudio>=2.11.0.dev0",
+    "triton",
 ]
 
 # ── uv index configuration ─────────────────────────────────────────────────────
