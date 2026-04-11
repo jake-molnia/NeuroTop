@@ -35,12 +35,19 @@ console = Console()
 
 # ─── Pruning utilities ────────────────────────────────────────────────────────
 
-def rf_gates(rf_scores: dict, device: torch.device, temp: float = 0.1) -> dict:
+def rf_gates(rf_scores: dict, device: torch.device, temp: float = 0.1,
+             quantile: float = 0.25) -> dict:
+    """Compute soft gates from RF scores.
+
+    Args:
+        quantile: Threshold quantile — only neurons below this percentile of
+            normalised RF are candidates for pruning.
+    """
     gates = {}
     for name, scores in rf_scores.items():
         rf = torch.tensor(scores, dtype=torch.float32, device=device)
         rf_norm = (rf - rf.min()) / (rf.max() - rf.min() + 1e-8)
-        tau = rf_norm.median()
+        tau = rf_norm.quantile(quantile)
         gates[name] = torch.sigmoid((rf_norm - tau) / temp)
     return gates
 
@@ -60,8 +67,16 @@ def otsu_threshold(vals: np.ndarray) -> float:
     return float(best_t)
 
 
-def hard_prune(model: nn.Module, gates: dict, prune_mask: dict) -> int:
-    """Zero out dead neurons and update prune_mask. Returns count of newly pruned neurons."""
+def hard_prune(model: nn.Module, gates: dict, prune_mask: dict,
+               max_prune_ratio: float = 0.20) -> int:
+    """Zero out dead neurons and update prune_mask.
+
+    Args:
+        max_prune_ratio: Maximum fraction of *currently alive* neurons to
+            prune per layer in a single cycle.
+    Returns:
+        Count of newly pruned neurons across all layers.
+    """
     modules = dict(model.named_modules())
     total = 0
     for name, g in gates.items():
@@ -75,14 +90,24 @@ def hard_prune(model: nn.Module, gates: dict, prune_mask: dict) -> int:
             continue
         idx = dead.nonzero(as_tuple=True)[0]
         existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool))
-        new_idx = idx[existing_mask[idx]]  # only count newly pruned
+
+        # Cap: never prune more than max_prune_ratio of alive neurons per layer
+        alive_count = existing_mask.sum().item()
+        max_kill = max(1, int(alive_count * max_prune_ratio))
+        new_candidates = idx[existing_mask[idx]]
+        if len(new_candidates) > max_kill:
+            gate_vals = g[new_candidates]
+            _, keep_order = gate_vals.sort()
+            new_candidates = new_candidates[keep_order[:max_kill]]
+            idx = new_candidates
+
         existing_mask[idx] = False
         prune_mask[name] = existing_mask
         with torch.no_grad():
             mod.weight.data[idx] = 0.0
             if mod.bias is not None:
                 mod.bias.data[idx] = 0.0
-        total += len(new_idx)
+        total += len(new_candidates)
     return total
 
 
@@ -103,15 +128,20 @@ def apply_prune_mask(model: nn.Module, prune_mask: dict) -> None:
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--modulus",         default=113,  show_default=True)
-@click.option("--prune-cycles",    default=6,    show_default=True)
+@click.option("--prune-cycles",    default=10,   show_default=True)
 @click.option("--finetune-epochs", default=50,   show_default=True)
 @click.option("--train-epochs",    default=100,  show_default=True)
 @click.option("--gate-temp",       default=0.1,  show_default=True)
+@click.option("--gate-quantile",   default=0.25, show_default=True,
+              help="RF quantile threshold for pruning (lower = more conservative)")
+@click.option("--max-prune-ratio", default=0.10, show_default=True,
+              help="Max fraction of alive neurons to prune per layer per cycle")
 @click.option("--max-samples",     default=512,  show_default=True)
 @click.option("--checkpoint",      default="outputs/modulus/grokking_checkpoint.pt", show_default=True)
 @click.option("--out-dir",         default="outputs/modulus", show_default=True)
 def main(modulus, prune_cycles, finetune_epochs, train_epochs,
-         gate_temp, max_samples, checkpoint, out_dir):
+         gate_temp, gate_quantile, max_prune_ratio,
+         max_samples, checkpoint, out_dir):
     """RF-gated iterative pruning on the modular addition transformer."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -171,9 +201,9 @@ def main(modulus, prune_cycles, finetune_epochs, train_epochs,
     for cycle in range(prune_cycles):
 
         # 1. RF gates + hard prune
-        gates          = rf_gates(rf_scores, device, temp=gate_temp)
+        gates          = rf_gates(rf_scores, device, temp=gate_temp, quantile=gate_quantile)
         rf_before      = {k: v.copy() for k, v in rf_scores.items()}
-        neurons_pruned = hard_prune(model, gates, prune_mask)
+        neurons_pruned = hard_prune(model, gates, prune_mask, max_prune_ratio=max_prune_ratio)
         total_pruned  += neurons_pruned
         acc_post_prune, _ = evaluate(model, test_loader, device)
         sparsity       = total_pruned / total_neurons

@@ -35,12 +35,23 @@ console = Console()
 
 # ─── Pruning utilities ────────────────────────────────────────────────────────
 
-def rf_gates(rf_scores: dict, device: torch.device, temp: float = 0.1) -> dict:
+def rf_gates(rf_scores: dict, device: torch.device, temp: float = 0.1,
+             quantile: float = 0.25) -> dict:
+    """Compute soft gates from RF scores.
+
+    Args:
+        rf_scores: Per-layer RF scores from ``analyze()``.
+        device: Torch device.
+        temp: Sigmoid temperature (lower = sharper gate).
+        quantile: Threshold quantile — only neurons below this percentile of
+            normalised RF are candidates for pruning.  Default 0.25 (25th
+            percentile) is much more conservative than the old median.
+    """
     gates = {}
     for name, scores in rf_scores.items():
         rf = torch.tensor(scores, dtype=torch.float32, device=device)
         rf_norm = (rf - rf.min()) / (rf.max() - rf.min() + 1e-8)
-        tau = rf_norm.median()
+        tau = rf_norm.quantile(quantile)
         gates[name] = torch.sigmoid((rf_norm - tau) / temp)
     return gates
 
@@ -60,8 +71,21 @@ def otsu_threshold(vals: np.ndarray) -> float:
     return float(best_t)
 
 
-def hard_prune(model: nn.Module, gates: dict, prune_mask: dict) -> int:
-    """Zero out dead neurons and update prune_mask. Returns count of newly pruned neurons."""
+def hard_prune(model: nn.Module, gates: dict, prune_mask: dict,
+               max_prune_ratio: float = 0.20) -> int:
+    """Zero out dead neurons and update prune_mask.
+
+    Args:
+        model: The model to prune.
+        gates: Per-layer soft gate values from ``rf_gates()``.
+        prune_mask: Accumulated mask tracking which neurons are alive.
+        max_prune_ratio: Maximum fraction of *currently alive* neurons to
+            prune per layer in a single cycle.  Prevents catastrophic
+            accuracy drops.  Default 0.20 (20%).
+
+    Returns:
+        Count of newly pruned neurons across all layers.
+    """
     modules = dict(model.named_modules())
     total = 0
     for name, g in gates.items():
@@ -75,14 +99,25 @@ def hard_prune(model: nn.Module, gates: dict, prune_mask: dict) -> int:
             continue
         idx = dead.nonzero(as_tuple=True)[0]
         existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool))
-        new_idx = idx[existing_mask[idx]]  # only count newly pruned
+
+        # Cap: never prune more than max_prune_ratio of alive neurons per layer
+        alive_count = existing_mask.sum().item()
+        max_kill = max(1, int(alive_count * max_prune_ratio))
+        new_candidates = idx[existing_mask[idx]]
+        if len(new_candidates) > max_kill:
+            # Keep only the lowest-gate neurons (most expendable)
+            gate_vals = g[new_candidates]
+            _, keep_order = gate_vals.sort()
+            new_candidates = new_candidates[keep_order[:max_kill]]
+            idx = new_candidates  # only prune the capped set
+
         existing_mask[idx] = False
         prune_mask[name] = existing_mask
         with torch.no_grad():
             mod.weight.data[idx] = 0.0
             if mod.bias is not None:
                 mod.bias.data[idx] = 0.0
-        total += len(new_idx)
+        total += len(new_candidates)
     return total
 
 
@@ -106,12 +141,17 @@ def apply_prune_mask(model: nn.Module, prune_mask: dict) -> None:
 @click.option("--finetune-epochs", default=20,   show_default=True)
 @click.option("--train-epochs",    default=50,   show_default=True)
 @click.option("--gate-temp",       default=0.1,  show_default=True)
+@click.option("--gate-quantile",   default=0.25, show_default=True,
+              help="RF quantile threshold for pruning (lower = more conservative)")
+@click.option("--max-prune-ratio", default=0.20, show_default=True,
+              help="Max fraction of alive neurons to prune per layer per cycle")
 @click.option("--max-samples",     default=512,  show_default=True)
 @click.option("--batch-size",      default=256,  show_default=True)
 @click.option("--checkpoint",      default="outputs/cifar/training_checkpoint.pt", show_default=True)
 @click.option("--out-dir",         default="outputs/cifar", show_default=True)
 def main(prune_cycles, finetune_epochs, train_epochs,
-         gate_temp, max_samples, batch_size, checkpoint, out_dir):
+         gate_temp, gate_quantile, max_prune_ratio,
+         max_samples, batch_size, checkpoint, out_dir):
     """RF-gated iterative pruning on the CIFAR-10 MLP."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -125,7 +165,7 @@ def main(prune_cycles, finetune_epochs, train_epochs,
 
     # ── Model + data ──────────────────────────────────────────────────────────
     model        = CifarMLP().to(device)
-    optimizer    = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer    = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-3)
     train_loader, test_loader = get_loaders(batch_size)
 
     # ── Load or train ─────────────────────────────────────────────────────────
@@ -134,6 +174,9 @@ def main(prune_cycles, finetune_epochs, train_epochs,
         console.print(f"[dim][green]\u2713[/] loaded checkpoint {checkpoint} (epoch {start_epoch})[/]\n")
     else:
         console.print(f"[yellow]no checkpoint {checkpoint} \u2014 training {train_epochs} epochs[/]")
+        pretrain_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_epochs,
+        )
         with Progress(
             TextColumn("[dim]{task.description}[/]"),
             BarColumn(),
@@ -144,6 +187,7 @@ def main(prune_cycles, finetune_epochs, train_epochs,
             task = p.add_task("pretrain", total=train_epochs)
             for _ in range(train_epochs):
                 train_epoch(model, train_loader, optimizer, criterion, device)
+                pretrain_sched.step()
                 p.advance(task)
         save_checkpoint(model, optimizer, train_epochs, checkpoint)
         console.print()
@@ -171,15 +215,18 @@ def main(prune_cycles, finetune_epochs, train_epochs,
     for cycle in range(prune_cycles):
 
         # 1. RF gates + hard prune
-        gates          = rf_gates(rf_scores, device, temp=gate_temp)
+        gates          = rf_gates(rf_scores, device, temp=gate_temp, quantile=gate_quantile)
         rf_before      = {k: v.copy() for k, v in rf_scores.items()}
-        neurons_pruned = hard_prune(model, gates, prune_mask)
+        neurons_pruned = hard_prune(model, gates, prune_mask, max_prune_ratio=max_prune_ratio)
         total_pruned  += neurons_pruned
         acc_post_prune, _ = evaluate(model, test_loader, device)
         sparsity       = total_pruned / total_neurons
 
         # 2. fine-tune the pruned model (re-apply mask each step so weights stay zeroed)
-        ft_opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        ft_opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-3)
+        ft_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            ft_opt, T_max=finetune_epochs,
+        )
 
         with Progress(
             TextColumn("{task.description}"),
@@ -197,6 +244,7 @@ def main(prune_cycles, finetune_epochs, train_epochs,
             )
             for _ in range(finetune_epochs):
                 train_epoch(model, train_loader, ft_opt, criterion, device)
+                ft_sched.step()
                 apply_prune_mask(model, prune_mask)
                 test_acc, _ = evaluate(model, test_loader, device)
                 col = "green" if test_acc >= acc_before - 0.05 else "yellow"

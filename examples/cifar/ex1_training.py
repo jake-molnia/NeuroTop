@@ -36,7 +36,7 @@ from ntop.utils import (
 @click.option("--epochs",              default=100,   show_default=True, help="Total training epochs")
 @click.option("--batch-size",          default=256,   show_default=True, help="Mini-batch size")
 @click.option("--lr",                  default=1e-3,  show_default=True, help="AdamW learning rate")
-@click.option("--weight-decay",        default=1e-4,  show_default=True, help="AdamW weight decay")
+@click.option("--weight-decay",        default=5e-3,  show_default=True, help="AdamW weight decay")
 @click.option("--analysis-interval",   default=5,     show_default=True, help="Epochs between RF analyses")
 @click.option("--max-samples",         default=500,   show_default=True, help="Activation samples for RF")
 @click.option("--checkpoint-interval", default=20,    show_default=True, help="Epochs between checkpoints")
@@ -60,11 +60,15 @@ def main(epochs, batch_size, lr, weight_decay,
 
     model     = CifarMLP().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
     start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
     if start_epoch > 0:
         click.echo(click.style(f"Resuming from epoch {start_epoch}.", dim=True))
+        # Advance scheduler to correct position after resume
+        for _ in range(start_epoch):
+            scheduler.step()
     train_loader, test_loader = get_loaders(batch_size)
 
     results: list[dict]       = []
@@ -75,6 +79,7 @@ def main(epochs, batch_size, lr, weight_decay,
         train_acc, train_loss = train_epoch(
             model, train_loader, optimizer, criterion, device
         )
+        scheduler.step()
 
         if epoch % checkpoint_interval == 0 and epoch > 0:
             save_checkpoint(model, optimizer, epoch, checkpoint_path)
