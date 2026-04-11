@@ -24,10 +24,10 @@ CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 # ─── Model ────────────────────────────────────────────────────────────────────
 
 class CifarMLP(nn.Module):
-    """Simple feed-forward MLP for CIFAR-10 classification.
+    """Feed-forward MLP for CIFAR-10 classification.
 
     Architecture:
-        flatten → Linear+ReLU (×3) → Linear (logits)
+        flatten → (Linear + BatchNorm + ReLU + Dropout) ×3 → Linear (logits)
 
     All intermediate Linear layers are hooked by ntop for RF analysis.
     """
@@ -37,6 +37,7 @@ class CifarMLP(nn.Module):
         input_dim: int = INPUT_DIM,
         hidden_dims: list[int] | None = None,
         num_classes: int = NUM_CLASSES,
+        dropout: float = 0.3,
     ):
         super().__init__()
         hidden_dims = hidden_dims or list(HIDDEN_DIMS)
@@ -44,7 +45,9 @@ class CifarMLP(nn.Module):
         prev = input_dim
         for dim in hidden_dims:
             layers.append(nn.Linear(prev, dim))
+            layers.append(nn.BatchNorm1d(dim))
             layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
             prev = dim
         layers.append(nn.Linear(prev, num_classes))
         self.net = nn.Sequential(*layers)
@@ -76,16 +79,22 @@ def get_loaders(
     Returns:
         ``(train_loader, test_loader)``
     """
-    transform = T.Compose([
+    train_transform = T.Compose([
+        T.RandomCrop(32, padding=4),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+    test_transform = T.Compose([
         T.ToTensor(),
         T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
 
     train_set = torchvision.datasets.CIFAR10(
-        root=data_dir, train=True, download=True, transform=transform,
+        root=data_dir, train=True, download=True, transform=train_transform,
     )
     test_set = torchvision.datasets.CIFAR10(
-        root=data_dir, train=False, download=True, transform=transform,
+        root=data_dir, train=False, download=True, transform=test_transform,
     )
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
