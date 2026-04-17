@@ -64,14 +64,15 @@ class ModularArithmeticModel(nn.Module):
 class ModularAdditionDataset(Dataset):
     """All ``(x, y)`` pairs for modular addition: label = ``(x + y) mod p``."""
 
-    def __init__(self, modulus: int):
+    def __init__(self, modulus: int, seed: int = 0):
         pairs = [
             (torch.tensor([x, y, modulus]),
              torch.tensor((x + y) % modulus))
             for x in range(modulus)
             for y in range(modulus)
         ]
-        np.random.shuffle(pairs)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(pairs)
         self.data = pairs
 
     def __len__(self) -> int:
@@ -87,6 +88,7 @@ def get_loaders(
     modulus: int,
     train_split: float,
     batch_size: int,
+    seed: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     """Build train and test DataLoaders for modular addition.
 
@@ -94,15 +96,19 @@ def get_loaders(
         modulus: p for (x + y) mod p.
         train_split: Fraction of pairs used for training.
         batch_size: Mini-batch size for both loaders.
+        seed: Seed controlling dataset order and train-loader shuffling.
 
     Returns:
         ``(train_loader, test_loader)``
     """
-    dataset = ModularAdditionDataset(modulus)
+    dataset = ModularAdditionDataset(modulus, seed=seed)
     split = int(len(dataset) * train_split)
     train_set = torch.utils.data.Subset(dataset, range(split))
     test_set = torch.utils.data.Subset(dataset, range(split, len(dataset)))
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True, generator=generator,
+    )
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 

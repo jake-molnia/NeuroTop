@@ -25,6 +25,7 @@ dependencies = [
     "scipy>=1.9.0",
     "pandas>=1.5.0",
     "rich>=14.3.3",
+    "torchvision>=0.26.0.dev20260323",
 ]
 
 [tool.setuptools.packages.find]
@@ -34,13 +35,19 @@ include = ["ntop*"]
 [project.optional-dependencies]
 # Nightly PyTorch with Blackwell (sm_120) support for Turing GPU clusters
 blackwell = [
-    "torch>=2.12.0.dev0",
-    "torchvision>=0.26.0.dev0",
-    "torchaudio>=2.11.0.dev0",
-    "triton",
+    "torch>=2.12.0.dev0; sys_platform == 'linux'",
+    "torchvision>=0.26.0.dev0; sys_platform == 'linux'",
+    "torchaudio>=2.11.0.dev0; sys_platform == 'linux'",
+    "triton; sys_platform == 'linux'",
 ]
 
-# ── uv index configuration ─────────────────────────────────────────────────────
+# ── uv configuration ─────────────────────────────────────────────────────────
+[tool.uv]
+environments = [
+    "sys_platform == 'linux'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
 [[tool.uv.index]]
 name = "pytorch-nightly-cu128"
 url = "https://download.pytorch.org/whl/nightly/cu128"
@@ -48,14 +55,14 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+    { index = "pytorch-nightly-cu128", extra = "blackwell", marker = "sys_platform == 'linux'" },
 ]
 torchvision = [
-    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+    { index = "pytorch-nightly-cu128", extra = "blackwell", marker = "sys_platform == 'linux'" },
 ]
 torchaudio = [
-    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+    { index = "pytorch-nightly-cu128", extra = "blackwell", marker = "sys_platform == 'linux'" },
 ]
 triton = [
-    { index = "pytorch-nightly-cu128", extra = "blackwell" },
+    { index = "pytorch-nightly-cu128", extra = "blackwell", marker = "sys_platform == 'linux'" },
 ]

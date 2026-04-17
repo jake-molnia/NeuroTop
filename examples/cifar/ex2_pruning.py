@@ -70,54 +70,63 @@ def otsu_threshold(vals: np.ndarray) -> float:
             best_var, best_t = var, t
     return float(best_t)
 
-
-def hard_prune(model: nn.Module, gates: dict, prune_mask: dict,
-               max_prune_ratio: float = 0.20) -> int:
-    """Zero out dead neurons and update prune_mask.
-
-    Args:
-        model: The model to prune.
-        gates: Per-layer soft gate values from ``rf_gates()``.
-        prune_mask: Accumulated mask tracking which neurons are alive.
-        max_prune_ratio: Maximum fraction of *currently alive* neurons to
-            prune per layer in a single cycle.  Prevents catastrophic
-            accuracy drops.  Default 0.20 (20%).
-
-    Returns:
-        Count of newly pruned neurons across all layers.
-    """
+def hard_prune(
+    model: nn.Module,
+    gates: dict,
+    prune_mask: dict,
+    max_prune_fraction: float,
+    max_prune_ratio: float = 0.20,
+    exclude_layers: set[str] | None = None,
+) -> int:
+    """Zero out the lowest-gate candidates with global and per-layer caps."""
     modules = dict(model.named_modules())
-    total = 0
+    exclude_layers = exclude_layers or set()
+    candidates: list[tuple[float, str, int]] = []
+    total_neurons = sum(
+        modules[name].weight.shape[0]
+        for name in gates
+        if name not in exclude_layers and isinstance(modules.get(name), nn.Linear)
+    )
+    max_new = max(1, int(np.ceil(total_neurons * max_prune_fraction)))
+
     for name, g in gates.items():
+        if name in exclude_layers:
+            continue
         mod = modules.get(name)
         if not isinstance(mod, nn.Linear):
             continue
         vals = g.detach().cpu().numpy()
         cut = otsu_threshold(vals)
-        dead = torch.tensor(vals < cut)
-        if not dead.any():
-            continue
-        idx = dead.nonzero(as_tuple=True)[0]
         existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool))
+        for idx in np.flatnonzero(vals < cut):
+            if existing_mask[idx]:
+                candidates.append((float(vals[idx]), name, int(idx)))
 
-        # Cap: never prune more than max_prune_ratio of alive neurons per layer
+    selected = candidates[:max_new] if len(candidates) <= max_new else sorted(candidates)[:max_new]
+    selected_by_layer: dict[str, list[int]] = {}
+    for _, name, idx in selected:
+        selected_by_layer.setdefault(name, []).append(idx)
+
+    total = 0
+    for name, indices in selected_by_layer.items():
+        mod = modules[name]
+        idx = torch.tensor(indices, dtype=torch.long)
+        existing_mask = prune_mask.get(name, torch.ones(mod.weight.shape[0], dtype=torch.bool))
+        new_idx = idx[existing_mask[idx]]
         alive_count = existing_mask.sum().item()
-        max_kill = max(1, int(alive_count * max_prune_ratio))
-        new_candidates = idx[existing_mask[idx]]
-        if len(new_candidates) > max_kill:
-            # Keep only the lowest-gate neurons (most expendable)
-            gate_vals = g[new_candidates]
+        max_kill = max(1, int(np.ceil(alive_count * max_prune_ratio)))
+        if len(new_idx) > max_kill:
+            gate_vals = gates[name][new_idx.to(gates[name].device)]
             _, keep_order = gate_vals.sort()
-            new_candidates = new_candidates[keep_order[:max_kill]]
-            idx = new_candidates  # only prune the capped set
-
-        existing_mask[idx] = False
+            new_idx = new_idx[keep_order[:max_kill].cpu()]
+        existing_mask[new_idx] = False
         prune_mask[name] = existing_mask
+        device_idx = new_idx.to(mod.weight.device)
         with torch.no_grad():
-            mod.weight.data[idx] = 0.0
+            mod.weight.data[device_idx] = 0.0
             if mod.bias is not None:
-                mod.bias.data[idx] = 0.0
-        total += len(new_candidates)
+                mod.bias.data[device_idx] = 0.0
+        total += len(new_idx)
     return total
 
 
@@ -128,10 +137,11 @@ def apply_prune_mask(model: nn.Module, prune_mask: dict) -> None:
         mod = modules.get(name)
         if mod is None:
             continue
+        device_mask = mask.to(mod.weight.device)
         with torch.no_grad():
-            mod.weight.data[~mask] = 0.0
+            mod.weight.data[~device_mask] = 0.0
             if mod.bias is not None:
-                mod.bias.data[~mask] = 0.0
+                mod.bias.data[~device_mask] = 0.0
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -147,11 +157,17 @@ def apply_prune_mask(model: nn.Module, prune_mask: dict) -> None:
               help="Max fraction of alive neurons to prune per layer per cycle")
 @click.option("--max-samples",     default=512,  show_default=True)
 @click.option("--batch-size",      default=256,  show_default=True)
+@click.option("--max-prune-fraction", type=click.FloatRange(0.0, 1.0, min_open=True),
+              default=0.05, show_default=True,
+              help="Maximum fraction of RF-tracked neurons to newly prune per cycle")
+@click.option("--include-output-layer", is_flag=True,
+              help="Allow pruning classifier output logits; disabled by default")
 @click.option("--checkpoint",      default="outputs/cifar/training_checkpoint.pt", show_default=True)
 @click.option("--out-dir",         default="outputs/cifar", show_default=True)
 def main(prune_cycles, finetune_epochs, train_epochs,
          gate_temp, gate_quantile, max_prune_ratio,
-         max_samples, batch_size, checkpoint, out_dir):
+         max_samples, batch_size, max_prune_fraction,
+         include_output_layer, checkpoint, out_dir):
     """RF-gated iterative pruning on the CIFAR-10 MLP."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -161,7 +177,10 @@ def main(prune_cycles, finetune_epochs, train_epochs,
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     criterion = nn.CrossEntropyLoss()
 
-    console.print(f"[dim]CIFAR-10 MLP  cycles={prune_cycles}  device={device}[/]")
+    console.print(
+        f"[dim]CIFAR-10 MLP  cycles={prune_cycles}  max_prune={max_prune_fraction:.1%}"
+        f"  device={device}[/]"
+    )
 
     # ── Model + data ──────────────────────────────────────────────────────────
     model        = CifarMLP().to(device)
@@ -197,8 +216,16 @@ def main(prune_cycles, finetune_epochs, train_epochs,
         acts      = collect_over_loader(model, test_loader, max_samples=max_samples, verbose=False)
         rf_scores = analyze(acts)
 
-    total_neurons = sum(len(v) for v in rf_scores.values())
-    console.print(f"[dim]{total_neurons} neurons  {len(rf_scores)} layers[/]\n")
+    exclude_layers = set() if include_output_layer else {"net.6"}
+    prunable_rf_scores = {
+        name: vals for name, vals in rf_scores.items()
+        if name not in exclude_layers
+    }
+    total_neurons = sum(len(v) for v in prunable_rf_scores.values())
+    console.print(
+        f"[dim]{total_neurons} prunable neurons  {len(prunable_rf_scores)} layers"
+        f"  excluded={sorted(exclude_layers) or 'none'}[/]\n"
+    )
 
     acc_before, _  = evaluate(model, test_loader, device)
     cycle_results: list[dict] = []
@@ -217,7 +244,10 @@ def main(prune_cycles, finetune_epochs, train_epochs,
         # 1. RF gates + hard prune
         gates          = rf_gates(rf_scores, device, temp=gate_temp, quantile=gate_quantile)
         rf_before      = {k: v.copy() for k, v in rf_scores.items()}
-        neurons_pruned = hard_prune(model, gates, prune_mask, max_prune_ratio=max_prune_ratio)
+        neurons_pruned = hard_prune(
+            model, gates, prune_mask, max_prune_fraction,
+            max_prune_ratio=max_prune_ratio, exclude_layers=exclude_layers,
+        )
         total_pruned  += neurons_pruned
         acc_post_prune, _ = evaluate(model, test_loader, device)
         sparsity       = total_pruned / total_neurons

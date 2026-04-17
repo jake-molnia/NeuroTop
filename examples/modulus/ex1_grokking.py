@@ -43,10 +43,11 @@ from ntop.utils import (
 @click.option("--analysis-interval",   default=100,    show_default=True, help="Epochs between RF analyses")
 @click.option("--max-samples",         default=500,    show_default=True, help="Activation samples for RF")
 @click.option("--checkpoint-interval", default=500,    show_default=True, help="Epochs between checkpoints")
+@click.option("--seed",                default=0,      show_default=True, help="Dataset/shuffle seed")
 @click.option("--out-dir",             default="outputs/modulus", show_default=True,
               help="Root output directory")
 def main(modulus, epochs, batch_size, train_split, lr, weight_decay,
-         analysis_interval, max_samples, checkpoint_interval, out_dir):
+         analysis_interval, max_samples, checkpoint_interval, seed, out_dir):
     """Train a transformer on modular addition and track RF topology through grokking."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -57,7 +58,7 @@ def main(modulus, epochs, batch_size, train_split, lr, weight_decay,
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    click.echo(f"Grokking experiment  p={modulus}  epochs={epochs:,}  device={device}")
+    click.echo(f"Grokking experiment  p={modulus}  epochs={epochs:,}  seed={seed}  device={device}")
     click.echo(click.style(f"  output: {out_dir}", dim=True))
     click.echo()
 
@@ -68,7 +69,7 @@ def main(modulus, epochs, batch_size, train_split, lr, weight_decay,
     start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
     if start_epoch > 0:
         click.echo(click.style(f"Resuming from epoch {start_epoch}.", dim=True))
-    train_loader, test_loader = get_loaders(modulus, train_split, batch_size)
+    train_loader, test_loader = get_loaders(modulus, train_split, batch_size, seed=seed)
 
     results: list[dict]       = []
     rf_history: list[dict]    = []
