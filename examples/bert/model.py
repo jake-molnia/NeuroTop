@@ -34,6 +34,7 @@ def get_loaders(
     tokenizer,
     batch_size: int = 16,
     max_length: int = 128,
+    seed: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
     """Load a GLUE task and return ``(train_loader, val_loader)``.
 
@@ -44,6 +45,7 @@ def get_loaders(
         tokenizer: HuggingFace tokenizer compatible with the model.
         batch_size: Batch size for both loaders.
         max_length: Tokeniser maximum sequence length.
+        seed: Seed controlling train-loader shuffling.
 
     Returns:
         ``(train_loader, val_loader)``
@@ -64,7 +66,7 @@ def get_loaders(
         tokenize, batched=True,
         remove_columns=[c for c in dataset["train"].column_names if c != "label"],
     )
-    tokenized = tokenized.rename_column("label", "labels").with_format("torch")
+    tokenized = tokenized.rename_column("label", "labels")
 
     train_data = tokenized["train"].select(
         range(min(subset_size, len(tokenized["train"])))
@@ -75,8 +77,12 @@ def get_loaders(
     )
 
     collator = DataCollatorWithPadding(tokenizer)
+    generator = torch.Generator().manual_seed(seed)
     return (
-        DataLoader(train_data, batch_size=batch_size, collate_fn=collator, shuffle=True),
+        DataLoader(
+            train_data, batch_size=batch_size, collate_fn=collator,
+            shuffle=True, generator=generator,
+        ),
         DataLoader(val_data, batch_size=batch_size, collate_fn=collator),
     )
 
@@ -89,6 +95,7 @@ def load_or_train_model(
     subset_size: int,
     models_dir: str,
     train_epochs: int,
+    seed: int = 0,
 ) -> tuple[nn.Module, object]:
     """Load a fine-tuned checkpoint from disk, or train one from scratch.
 
@@ -101,6 +108,7 @@ def load_or_train_model(
         subset_size: Training sample limit.
         models_dir: Root directory for model checkpoints.
         train_epochs: Number of fine-tuning epochs when training from scratch.
+        seed: Seed controlling training initialization and data shuffling.
 
     Returns:
         ``(model, tokenizer)``
@@ -118,10 +126,11 @@ def load_or_train_model(
         )
 
     print(f"Training {model_name} on {dataset_name} for {train_epochs} epochs ...")
+    torch.manual_seed(seed)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=GLUE_NUM_LABELS[dataset_name]
     ).to(device)
-    train_loader, _ = get_loaders(dataset_name, subset_size, tokenizer)
+    train_loader, _ = get_loaders(dataset_name, subset_size, tokenizer, seed=seed)
     optimizer = optim.AdamW(model.parameters(), lr=2e-5)
 
     for epoch in range(train_epochs):

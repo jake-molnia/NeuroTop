@@ -27,22 +27,31 @@ def _run(cmd: list[str]) -> None:
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--example", "example_name",
-              type=click.Choice(["modulus", "cifar"]), required=True)
+              type=click.Choice(["modulus", "cifar", "bert"]), required=True)
 @click.option("--fractions", default="0.02,0.05,0.10", show_default=True,
               help="Comma-separated max-prune-fraction values.")
 @click.option("--out-dir", type=click.Path(file_okay=False, path_type=Path),
               required=True, help="Directory that will contain one run per fraction.")
-@click.option("--checkpoint", type=click.Path(dir_okay=False), required=True)
+@click.option("--checkpoint", type=click.Path(dir_okay=False),
+              help="Checkpoint path; required for modulus and CIFAR, ignored by BERT.")
 @click.option("--prune-cycles", default=6, show_default=True)
 @click.option("--finetune-epochs", default=10, show_default=True)
 @click.option("--train-epochs", default=100, show_default=True)
 @click.option("--max-samples", default=256, show_default=True)
+@click.option("--subset-size", default=1000, show_default=True,
+              help="BERT train subset size; ignored by modulus and CIFAR.")
 @click.option("--batch-size", default=256, show_default=True,
-              help="CIFAR batch size; ignored by modulus.")
+              help="Batch size for CIFAR and BERT; ignored by modulus.")
 @click.option("--modulus", default=113, show_default=True,
               help="Modulus value; ignored by CIFAR.")
+@click.option("--dataset", default="cola", show_default=True,
+              help="GLUE dataset; BERT only.")
+@click.option("--model-name", default="bert-base-uncased", show_default=True,
+              help="HuggingFace model name; BERT only.")
+@click.option("--models-dir", default="./trained_models", show_default=True,
+              help="Model checkpoint directory; BERT only.")
 @click.option("--seed", default=0, show_default=True,
-              help="Modulus split/shuffle seed; ignored by CIFAR.")
+              help="Seed for examples that support deterministic loaders.")
 @click.option("--max-accuracy-drop", default=0.02, show_default=True)
 @click.option("--min-final-sparsity", default=0.0, show_default=True)
 def main(
@@ -54,8 +63,12 @@ def main(
     finetune_epochs: int,
     train_epochs: int,
     max_samples: int,
+    subset_size: int,
     batch_size: int,
     modulus: int,
+    dataset: str,
+    model_name: str,
+    models_dir: str,
     seed: int,
     max_accuracy_drop: float,
     min_final_sparsity: float,
@@ -63,6 +76,8 @@ def main(
     values = [float(part.strip()) for part in fractions.split(",") if part.strip()]
     if not values:
         raise click.ClickException("At least one fraction is required.")
+    if example_name in {"modulus", "cifar"} and not checkpoint:
+        raise click.ClickException("--checkpoint is required for modulus and CIFAR.")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
@@ -79,13 +94,28 @@ def main(
             "--max-prune-fraction", str(value),
             "--max-accuracy-drop", str(max_accuracy_drop),
             "--min-final-sparsity", str(min_final_sparsity),
-            "--checkpoint", checkpoint,
             "--out-dir", os.fspath(run_dir),
         ]
         if example_name == "modulus":
-            cmd.extend(["--modulus", str(modulus), "--seed", str(seed)])
+            cmd.extend([
+                "--checkpoint", checkpoint,
+                "--modulus", str(modulus),
+                "--seed", str(seed),
+            ])
+        elif example_name == "cifar":
+            cmd.extend([
+                "--checkpoint", checkpoint,
+                "--batch-size", str(batch_size),
+            ])
         else:
-            cmd.extend(["--batch-size", str(batch_size)])
+            cmd.extend([
+                "--dataset", dataset,
+                "--model-name", model_name,
+                "--subset-size", str(subset_size),
+                "--batch-size", str(batch_size),
+                "--models-dir", models_dir,
+                "--seed", str(seed),
+            ])
 
         status = "passed"
         error = ""
@@ -96,6 +126,10 @@ def main(
             error = f"exit code {exc.returncode}"
 
         csv_path = run_dir / "pruning_results.csv"
+        if not csv_path.exists():
+            matches = sorted(run_dir.glob("*/pruning_results.csv"))
+            if len(matches) == 1:
+                csv_path = matches[0]
         if csv_path.exists():
             df = pd.read_csv(csv_path)
             if not df.empty:
@@ -116,11 +150,14 @@ def main(
                 })
                 continue
 
+        if status == "passed":
+            status = "failed"
+            error = "missing or empty pruning_results.csv"
         rows.append({
             "example": example_name,
             "max_prune_fraction": value,
             "status": status,
-            "error": error or "missing or empty pruning_results.csv",
+            "error": error,
             "baseline_acc": None,
             "final_acc": None,
             "acc_delta": None,
