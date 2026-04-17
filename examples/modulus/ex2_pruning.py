@@ -158,13 +158,19 @@ def apply_prune_mask(model: nn.Module, prune_mask: dict) -> None:
               help="Maximum fraction of RF-tracked neurons to newly prune per cycle")
 @click.option("--include-output-layer", is_flag=True,
               help="Allow pruning classifier output logits; disabled by default")
+@click.option("--max-accuracy-drop", type=click.FloatRange(0.0, 1.0),
+              default=0.02, show_default=True,
+              help="Fail if final fine-tuned accuracy drops more than this from baseline")
+@click.option("--min-final-sparsity", type=click.FloatRange(0.0, 1.0),
+              default=0.0, show_default=True,
+              help="Fail if final prunable-neuron sparsity is below this value")
 @click.option("--seed",            default=0,    show_default=True)
 @click.option("--checkpoint",      default="outputs/modulus/grokking_checkpoint.pt", show_default=True)
 @click.option("--out-dir",         default="outputs/modulus", show_default=True)
 def main(modulus, prune_cycles, finetune_epochs, train_epochs,
          gate_temp, gate_quantile, max_prune_ratio,
          max_samples, max_prune_fraction, include_output_layer,
-         seed, checkpoint, out_dir):
+         max_accuracy_drop, min_final_sparsity, seed, checkpoint, out_dir):
     """RF-gated iterative pruning on the modular addition transformer."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -223,6 +229,7 @@ def main(modulus, prune_cycles, finetune_epochs, train_epochs,
     )
 
     acc_before, _  = evaluate(model, test_loader, device)
+    baseline_acc = acc_before
     cycle_results: list[dict] = []
     rf_snapshots:  list[dict] = []
     total_pruned = 0
@@ -339,6 +346,27 @@ def main(modulus, prune_cycles, finetune_epochs, train_epochs,
 
     console.print(f"[green]✓[/] results → [underline]{csv_path}[/]")
     console.print(f"[green]✓[/] plots   → [underline]{plots_dir}[/]\n")
+
+    if not cycle_results:
+        raise click.ClickException("No pruning cycles ran; cannot validate pruning result.")
+
+    final_acc = cycle_results[-1]["acc_post_finetune"]
+    final_sparsity = cycle_results[-1]["sparsity"]
+    allowed_acc = baseline_acc - max_accuracy_drop
+    if final_acc < allowed_acc:
+        raise click.ClickException(
+            f"Final accuracy {final_acc:.4f} is below allowed floor {allowed_acc:.4f} "
+            f"(baseline={baseline_acc:.4f}, max_drop={max_accuracy_drop:.4f})."
+        )
+    if final_sparsity < min_final_sparsity:
+        raise click.ClickException(
+            f"Final sparsity {final_sparsity:.4f} is below required "
+            f"{min_final_sparsity:.4f}."
+        )
+    console.print(
+        f"[green]✓[/] validation passed  final_acc={final_acc:.4f}"
+        f"  baseline={baseline_acc:.4f}  sparsity={final_sparsity:.1%}"
+    )
 
 
 if __name__ == "__main__":
