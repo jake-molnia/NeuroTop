@@ -69,12 +69,14 @@ class CifarMLP(nn.Module):
 def get_loaders(
     batch_size: int = 256,
     data_dir: str = "./data",
+    seed: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Build train and test DataLoaders for CIFAR-10.
 
     Args:
         batch_size: Mini-batch size for both loaders.
         data_dir: Root directory for dataset download / cache.
+        seed: Optional seed for deterministic train-loader shuffling.
 
     Returns:
         ``(train_loader, test_loader)``
@@ -97,7 +99,14 @@ def get_loaders(
         root=data_dir, train=False, download=True, transform=test_transform,
     )
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True, generator=generator,
+    )
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 

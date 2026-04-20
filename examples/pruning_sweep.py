@@ -52,6 +52,14 @@ def _run(cmd: list[str]) -> None:
               help="Model checkpoint directory; BERT only.")
 @click.option("--seed", default=0, show_default=True,
               help="Seed for examples that support deterministic loaders.")
+@click.option("--pruning-method", type=click.Choice(["rf", "random", "hybrid", "hybrid_no_rf", "hybrid_rf_filter"]),
+              default="rf", show_default=True)
+@click.option("--alpha", default=1.0, show_default=True,
+              help="Hybrid weight for normalized weight-magnitude rank.")
+@click.option("--beta", default=1.0, show_default=True,
+              help="Hybrid weight for normalized activation-importance rank.")
+@click.option("--gamma", default=1.0, show_default=True,
+              help="Hybrid reward for normalized parameter-savings rank.")
 @click.option("--max-accuracy-drop", default=0.02, show_default=True)
 @click.option("--min-final-sparsity", default=0.0, show_default=True)
 def main(
@@ -70,6 +78,10 @@ def main(
     model_name: str,
     models_dir: str,
     seed: int,
+    pruning_method: str,
+    alpha: float,
+    beta: float,
+    gamma: float,
     max_accuracy_drop: float,
     min_final_sparsity: float,
 ) -> None:
@@ -92,6 +104,10 @@ def main(
             "--train-epochs", str(train_epochs),
             "--max-samples", str(max_samples),
             "--max-prune-fraction", str(value),
+            "--pruning-method", pruning_method,
+            "--alpha", str(alpha),
+            "--beta", str(beta),
+            "--gamma", str(gamma),
             "--max-accuracy-drop", str(max_accuracy_drop),
             "--min-final-sparsity", str(min_final_sparsity),
             "--out-dir", os.fspath(run_dir),
@@ -106,6 +122,7 @@ def main(
             cmd.extend([
                 "--checkpoint", checkpoint,
                 "--batch-size", str(batch_size),
+                "--seed", str(seed),
             ])
         else:
             cmd.extend([
@@ -135,8 +152,17 @@ def main(
             if not df.empty:
                 first = df.iloc[0]
                 last = df.iloc[-1]
+                required_columns = {"parameter_sparsity", "total_params", "nonzero_params"}
+                missing_columns = required_columns.difference(df.columns)
+                if missing_columns:
+                    status = "failed"
+                    error = f"missing columns: {','.join(sorted(missing_columns))}"
                 rows.append({
                     "example": example_name,
+                    "pruning_method": str(last.get("pruning_method", pruning_method)),
+                    "alpha": float(last.get("alpha", alpha)),
+                    "beta": float(last.get("beta", beta)),
+                    "gamma": float(last.get("gamma", gamma)),
                     "max_prune_fraction": value,
                     "status": status,
                     "error": error,
@@ -145,6 +171,9 @@ def main(
                     "acc_delta": float(last["acc_post_finetune"] - first["acc_before_prune"]),
                     "min_post_prune_acc": float(df["acc_post_prune"].min()),
                     "final_sparsity": float(last["sparsity"]),
+                    "final_parameter_sparsity": float(last["parameter_sparsity"]) if "parameter_sparsity" in df.columns else None,
+                    "total_params": int(last["total_params"]) if "total_params" in df.columns else None,
+                    "nonzero_params": int(last["nonzero_params"]) if "nonzero_params" in df.columns else None,
                     "total_pruned": int(df["neurons_pruned"].sum()),
                     "results_csv": os.fspath(csv_path),
                 })
@@ -155,6 +184,10 @@ def main(
             error = "missing or empty pruning_results.csv"
         rows.append({
             "example": example_name,
+            "pruning_method": pruning_method,
+            "alpha": alpha,
+            "beta": beta,
+            "gamma": gamma,
             "max_prune_fraction": value,
             "status": status,
             "error": error,
@@ -163,6 +196,9 @@ def main(
             "acc_delta": None,
             "min_post_prune_acc": None,
             "final_sparsity": None,
+            "final_parameter_sparsity": None,
+            "total_params": None,
+            "nonzero_params": None,
             "total_pruned": None,
             "results_csv": os.fspath(csv_path),
         })

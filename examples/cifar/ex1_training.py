@@ -42,8 +42,10 @@ from ntop.utils import (
 @click.option("--checkpoint-interval", default=20,    show_default=True, help="Epochs between checkpoints")
 @click.option("--out-dir",             default="outputs/cifar", show_default=True,
               help="Root output directory")
+@click.option("--seed",                default=0,     show_default=True,
+              help="Seed for model initialization and train-loader shuffling")
 def main(epochs, batch_size, lr, weight_decay,
-         analysis_interval, max_samples, checkpoint_interval, out_dir):
+         analysis_interval, max_samples, checkpoint_interval, out_dir, seed):
     """Train an MLP on CIFAR-10 and track RF topology throughout training."""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -54,7 +56,10 @@ def main(epochs, batch_size, lr, weight_decay,
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    click.echo(f"CIFAR-10 MLP training  epochs={epochs:,}  device={device}")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    click.echo(f"CIFAR-10 MLP training  epochs={epochs:,}  seed={seed}  device={device}")
     click.echo(click.style(f"  output: {out_dir}", dim=True))
     click.echo()
 
@@ -69,7 +74,7 @@ def main(epochs, batch_size, lr, weight_decay,
         # Advance scheduler to correct position after resume
         for _ in range(start_epoch):
             scheduler.step()
-    train_loader, test_loader = get_loaders(batch_size)
+    train_loader, test_loader = get_loaders(batch_size, seed=seed)
 
     results: list[dict]       = []
     rf_history: list[dict]    = []

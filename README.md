@@ -9,5 +9,5 @@ uv run -m examples.cifar.ex2_pruning --checkpoint outputs/cifar/training_checkpo
 ```
 
 ```bash
-uv run -m examples.pruning_sweep --example bert --dataset cola --model-name bert-base-uncased --fractions 0.02,0.05 --out-dir /tmp/neurotop_next/bert_cola_sweep --prune-cycles 2 --finetune-epochs 1 --train-epochs 1 --subset-size 1000 --max-samples 128 --batch-size 16 --models-dir ./trained_models --seed 0 --max-accuracy-drop 0.03 --min-final-sparsity 0.02
+uv run -m examples.final_experiments --example bert --out-dir /tmp/neurotop_final_bert_best_2pt --methods rf,random --seeds 0 --fractions 0.04 --prune-cycles 4 --finetune-epochs 2 --train-epochs 3 --subset-size 5000 --max-samples 512 --batch-size 32 --models-dir ./trained_models_serious --dataset cola --model-name bert-base-uncased --max-accuracy-drop 0.02 --min-final-sparsity 0.05
 ```
