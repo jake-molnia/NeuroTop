@@ -21,7 +21,67 @@ from transformers import (
 
 # ─── Shared constants ─────────────────────────────────────────────────────────
 
-GLUE_NUM_LABELS = {"cola": 2, "sst2": 2, "mrpc": 2, "qqp": 2, "stsb": 1, "rte": 2}
+GLUE_TASKS = {
+    "cola": {
+        "num_labels": 2,
+        "text_columns": ("sentence",),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "sst2": {
+        "num_labels": 2,
+        "text_columns": ("sentence",),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "mrpc": {
+        "num_labels": 2,
+        "text_columns": ("sentence1", "sentence2"),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "qqp": {
+        "num_labels": 2,
+        "text_columns": ("question1", "question2"),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "stsb": {
+        "num_labels": 1,
+        "text_columns": ("sentence1", "sentence2"),
+        "validation_split": "validation",
+        "metric": "regression",
+    },
+    "rte": {
+        "num_labels": 2,
+        "text_columns": ("sentence1", "sentence2"),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "qnli": {
+        "num_labels": 2,
+        "text_columns": ("question", "sentence"),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+    "mnli": {
+        "num_labels": 3,
+        "text_columns": ("premise", "hypothesis"),
+        "validation_split": "validation_matched",
+        "metric": "accuracy",
+    },
+    "wnli": {
+        "num_labels": 2,
+        "text_columns": ("sentence1", "sentence2"),
+        "validation_split": "validation",
+        "metric": "accuracy",
+    },
+}
+
+GLUE_NUM_LABELS = {name: spec["num_labels"] for name, spec in GLUE_TASKS.items()}
+GLUE_CLASSIFICATION_TASKS = tuple(
+    name for name, spec in GLUE_TASKS.items() if spec["metric"] == "accuracy"
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -50,11 +110,13 @@ def get_loaders(
     Returns:
         ``(train_loader, val_loader)``
     """
+    if dataset_name not in GLUE_TASKS:
+        valid = ", ".join(sorted(GLUE_TASKS))
+        raise ValueError(f"Unknown GLUE task {dataset_name!r}; expected one of: {valid}")
+
+    spec = GLUE_TASKS[dataset_name]
     dataset = load_dataset("glue", dataset_name)
-    text_cols = (
-        ["sentence"] if dataset_name in ["cola", "sst2"]
-        else ["sentence1", "sentence2"]
-    )
+    text_cols = spec["text_columns"]
 
     def tokenize(examples):
         return tokenizer(
@@ -71,7 +133,9 @@ def get_loaders(
     train_data = tokenized["train"].select(
         range(min(subset_size, len(tokenized["train"])))
     )
-    val_key = "validation" if "validation" in tokenized else "test"
+    val_key = spec["validation_split"]
+    if val_key not in tokenized:
+        val_key = "validation" if "validation" in tokenized else "test"
     val_data = tokenized[val_key].select(
         range(min(subset_size // 4, len(tokenized[val_key])))
     )

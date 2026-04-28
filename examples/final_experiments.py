@@ -11,6 +11,8 @@ from pathlib import Path
 import click
 import pandas as pd
 
+from examples.bert.model import GLUE_CLASSIFICATION_TASKS, GLUE_TASKS
+
 
 def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
@@ -70,6 +72,8 @@ def _write_provenance(out_dir: Path, cwd: Path, command_text: str) -> None:
 @click.option("--batch-size", default=32, show_default=True)
 @click.option("--modulus", default=113, show_default=True)
 @click.option("--dataset", default="cola", show_default=True)
+@click.option("--datasets", default=None,
+              help="Comma-separated GLUE task list for BERT. Overrides --dataset.")
 @click.option("--model-name", default="bert-base-uncased", show_default=True)
 @click.option("--models-dir", default="./trained_models", show_default=True)
 @click.option("--max-accuracy-drop", default=0.02, show_default=True)
@@ -92,6 +96,7 @@ def main(
     batch_size: int,
     modulus: int,
     dataset: str,
+    datasets: str | None,
     model_name: str,
     models_dir: str,
     max_accuracy_drop: float,
@@ -101,56 +106,91 @@ def main(
     out_dir.mkdir(parents=True, exist_ok=True)
     rows: list[pd.DataFrame] = []
 
-    for method in _split_csv(methods):
-        for seed in _split_csv(seeds):
-            run_dir = out_dir / example / method / f"seed_{seed}"
-            cmd = [
-                sys.executable, "-m", "examples.pruning_sweep",
-                "--example", example,
-                "--fractions", fractions,
-                "--out-dir", os.fspath(run_dir),
-                "--prune-cycles", str(prune_cycles),
-                "--finetune-epochs", str(finetune_epochs),
-                "--train-epochs", str(train_epochs),
-                "--max-samples", str(max_samples),
-                "--subset-size", str(subset_size),
-                "--batch-size", str(batch_size),
-                "--modulus", str(modulus),
-                "--dataset", dataset,
-                "--model-name", model_name,
-                "--models-dir", models_dir,
-                "--seed", seed,
-                "--pruning-method", method,
-                "--alpha", str(alpha),
-                "--beta", str(beta),
-                "--gamma", str(gamma),
-                "--max-accuracy-drop", str(max_accuracy_drop),
-                "--min-final-sparsity", str(min_final_sparsity),
-            ]
-            if checkpoint:
-                cmd.extend(["--checkpoint", checkpoint])
+    dataset_values = [dataset]
+    if datasets:
+        dataset_values = _split_csv(datasets)
+        if example != "bert":
+            raise click.ClickException("--datasets is only supported for --example bert.")
+    if example == "bert":
+        unknown = sorted(set(dataset_values).difference(GLUE_TASKS))
+        if unknown:
+            raise click.ClickException(f"Unknown GLUE task(s): {','.join(unknown)}")
+        regression = [
+            name for name in dataset_values
+            if name not in GLUE_CLASSIFICATION_TASKS
+        ]
+        if regression:
+            raise click.ClickException(
+                "final_experiments currently reports accuracy; run regression "
+                f"GLUE tasks separately: {','.join(regression)}"
+            )
 
-            _write_provenance(run_dir, cwd, " ".join(cmd))
-            status = _run(cmd, cwd, run_dir / "run.log")
+    multiple_datasets = example == "bert" and len(dataset_values) > 1
 
-            summary_path = run_dir / "sweep_summary.csv"
-            if summary_path.exists():
-                df = pd.read_csv(summary_path)
-                df["pruning_seed"] = int(seed)
-                df["run_status"] = "passed" if status == 0 else "failed"
-                rows.append(df)
-            else:
-                rows.append(pd.DataFrame([{
-                    "example": example,
-                    "pruning_method": method,
-                    "pruning_seed": int(seed),
-                    "run_status": "failed",
-                    "error": "missing sweep_summary.csv",
-                }]))
+    for dataset_name in dataset_values:
+        dataset_prefix = dataset_name if multiple_datasets else None
+        dataset_root = out_dir / dataset_name if dataset_prefix else out_dir
+        for method in _split_csv(methods):
+            for seed in _split_csv(seeds):
+                run_dir = dataset_root / example / method / f"seed_{seed}"
+                cmd = [
+                    sys.executable, "-m", "examples.pruning_sweep",
+                    "--example", example,
+                    "--fractions", fractions,
+                    "--out-dir", os.fspath(run_dir),
+                    "--prune-cycles", str(prune_cycles),
+                    "--finetune-epochs", str(finetune_epochs),
+                    "--train-epochs", str(train_epochs),
+                    "--max-samples", str(max_samples),
+                    "--subset-size", str(subset_size),
+                    "--batch-size", str(batch_size),
+                    "--modulus", str(modulus),
+                    "--dataset", dataset_name,
+                    "--model-name", model_name,
+                    "--models-dir", models_dir,
+                    "--seed", seed,
+                    "--pruning-method", method,
+                    "--alpha", str(alpha),
+                    "--beta", str(beta),
+                    "--gamma", str(gamma),
+                    "--max-accuracy-drop", str(max_accuracy_drop),
+                    "--min-final-sparsity", str(min_final_sparsity),
+                ]
+                if checkpoint:
+                    cmd.extend(["--checkpoint", checkpoint])
+
+                _write_provenance(run_dir, cwd, " ".join(cmd))
+                status = _run(cmd, cwd, run_dir / "run.log")
+
+                summary_path = run_dir / "sweep_summary.csv"
+                if summary_path.exists():
+                    df = pd.read_csv(summary_path)
+                    if example == "bert":
+                        df["dataset"] = dataset_name
+                        df["model_name"] = model_name
+                    df["pruning_seed"] = int(seed)
+                    df["run_status"] = "passed" if status == 0 else "failed"
+                    rows.append(df)
+                else:
+                    rows.append(pd.DataFrame([{
+                        "example": example,
+                        "dataset": dataset_name if example == "bert" else "",
+                        "model_name": model_name if example == "bert" else "",
+                        "pruning_method": method,
+                        "pruning_seed": int(seed),
+                        "run_status": "failed",
+                        "error": "missing sweep_summary.csv",
+                    }]))
 
     combined = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    combined_path = out_dir / f"{example}_combined_summary.csv"
+    combined_name = f"{example}_glue_combined_summary.csv" if multiple_datasets else f"{example}_combined_summary.csv"
+    combined_path = out_dir / combined_name
     combined.to_csv(combined_path, index=False)
+    if multiple_datasets and not combined.empty:
+        for dataset_name, dataset_df in combined.groupby("dataset", dropna=False):
+            dataset_path = out_dir / str(dataset_name) / f"{example}_{dataset_name}_combined_summary.csv"
+            dataset_path.parent.mkdir(parents=True, exist_ok=True)
+            dataset_df.to_csv(dataset_path, index=False)
     click.echo(f"Saved combined summary to {combined_path}")
     if not combined.empty:
         click.echo(combined.to_string(index=False))
